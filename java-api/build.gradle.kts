@@ -1,5 +1,6 @@
 plugins {
     `java-library`
+    `maven-publish`
 }
 
 group = "com.frc6324"
@@ -28,6 +29,53 @@ testing {
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
+    }
+    // Published alongside the binary so consumers get the module sources and
+    // generated API docs from the local Maven repository too.
+    withSourcesJar()
+    withJavadocJar()
+}
+
+// ---------------------------------------------------------------------------
+// Publishing
+//
+// `./gradlew publishToMavenLocal` installs
+// com.frc6324:bdcudatag:<version> under ~/.m2/repository, so sibling builds
+// can depend on it with `mavenLocal()` instead of a project path.
+// ---------------------------------------------------------------------------
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            from(components["java"])
+
+            groupId = "com.frc6324"
+            artifactId = "bdcudatag"
+            version = project.version.toString()
+
+            pom {
+                name = "bdcudatag"
+                description = "CUDA AprilTag-family detector (tag36h11, tag16h5) with Java FFM bindings."
+                url = "https://github.com/cobouch/bd-apriltag"
+
+                licenses {
+                    license {
+                        name = "BSD 3-Clause License"
+                        url = "https://opensource.org/license/bsd-3-clause/"
+                        distribution = "repo"
+                    }
+                }
+
+                scm {
+                    connection = "scm:git:git://github.com/cobouch/bd-apriltag.git"
+                    developerConnection = "scm:git:ssh://github.com/cobouch/bd-apriltag.git"
+                    url = "https://github.com/cobouch/bd-apriltag"
+                }
+            }
+        }
+    }
+
+    repositories {
+        mavenLocal()
     }
 }
 
@@ -92,18 +140,11 @@ val bundleNativeLibrary = tasks.register<Sync>("bundleNativeLibrary") {
     }
 }
 
-sourceSets {
-    named("main") {
-        resources.srcDir(generatedNativeResources.get().asFile)
-    }
-}
-
-tasks.processResources {
-    dependsOn(bundleNativeLibrary)
-}
-
+// The staged native library goes into the binary jar only, never the resource
+// output or sources jar (which is what keeps `publishToMavenLocal` consistent).
 tasks.jar {
     dependsOn(bundleNativeLibrary)
+    from(generatedNativeResources)
 }
 
 tasks.test {

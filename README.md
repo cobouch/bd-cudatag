@@ -160,6 +160,35 @@ synchronous and thread-safe: calls on one instance are serialized, so a single
 detector may be shared between threads. `stats()` returns frame counts,
 GPU/total timing, run/candidate/quad counts and ROI rows.
 
+### Publishing to Maven Local
+
+The module can be installed in the local Maven repository so sibling builds can
+consume it as a normal dependency:
+
+```bash
+cd java-api
+./gradlew publishToMavenLocal            # bundles ../detector/build/Release
+./gradlew publishToMavenLocal -Pbdcudatag.native.dir=/path/to/build
+```
+
+That publishes `com.frc6324:bdcudatag:0.1.0` (binary jar with the bundled native
+library, sources jar, javadoc jar, POM and Gradle module metadata) under
+`~/.m2/repository`. In a consuming build:
+
+```kotlin
+repositories {
+    mavenLocal()
+}
+
+dependencies {
+    implementation("com.frc6324:bdcudatag:0.1.0")
+}
+```
+
+The published jar contains the native library for the platform that built it,
+so publish once per platform you target. The `--enable-native-access` flag from
+above still applies to the consuming JVM.
+
 ## C API
 
 The ABI is in `detector/include/bdcudatag/bdcudatag.h`; the RAII C++ wrapper is
