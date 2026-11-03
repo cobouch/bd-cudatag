@@ -189,6 +189,18 @@ The published jar contains the native library for the platform that built it,
 so publish once per platform you target. The `--enable-native-access` flag from
 above still applies to the consuming JVM.
 
+## Camera test app
+
+`viewer/` is a standalone Swing application for testing the detector against a
+camera, video file or still image. It outlines each tag, labels its id, and
+reports FPS, GPU time and ROI rows. See [`viewer/README.md`](viewer/README.md)
+for requirements, options and platform notes.
+
+```bash
+cd viewer
+./gradlew run
+```
+
 ## C API
 
 The ABI is in `detector/include/bdcudatag/bdcudatag.h`; the RAII C++ wrapper is
@@ -252,4 +264,5 @@ detector/
   tests/               synthetic end-to-end tests (no camera required)
   bench/               synthetic throughput benchmark
 java-api/              Java FFM wrapper (JPMS module) and JUnit tests
+viewer/                Swing camera test app (separate Gradle build)
 ```

@@ -10,3 +10,8 @@ java-api/bin
 
 # Local benchmark dumps
 *.pgm
+
+# Camera viewer
+viewer/.gradle
+viewer/build
+snapshot-*.png
