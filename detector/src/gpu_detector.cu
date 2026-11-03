@@ -7,7 +7,7 @@
 //   4. union-find merge of runs (8-connected)         (k_merge_runs)
 //   5. component area / bounding box statistics       (k_region_stats)
 //   6. tag-like component filtering                   (k_collect_candidates)
-//   7. contour trace, quad fit, subpixel corner refine(k_fit_quads)
+//   7. boundary fit, quad corners, subpixel edge lines   (k_fit_quads)
 //   8. four-rotation sampling + Hamming decode        (k_decode_quads)
 //   9. de-duplicate and sort detections               (k_finalize)
 //
@@ -40,11 +40,13 @@ constexpr int kMinTileContrast = 12;
 constexpr int kFindRunsThreads = 256;
 constexpr int kMergeWarps = 4;
 constexpr int kMergeThreads = kMergeWarps * 32;
-constexpr int kMinContourCapacity = 2048;
-constexpr int kMaxContourCapacity = 16384;
-// Contours up to this length are copied to shared memory before polygon
-// simplification, which reads the same points many times.
-constexpr int kSharedContourPoints = 8192;
+// Boundary fit: one block per candidate, four warps, one warp per quad edge.
+constexpr int kFitThreads = 128;
+constexpr int kFitWarps = kFitThreads / 32;
+constexpr int kFitDirections = 32;      // hull probe directions
+constexpr int kMaxBoundaryRows = 1024;  // bbox rows kept per candidate
+constexpr int kMaxHullVertices = 64;
+constexpr int kFitIterations = 2;  // edge-line re-fits per candidate
 
 struct PipelineArgs {
     const uint8_t* gray = nullptr;
@@ -59,7 +61,6 @@ struct PipelineArgs {
     int min_cluster_pixels = 0;
     int min_tag_pixels = 0;
     int max_candidates = 0;
-    int contour_cap = 0;
     int bits_per_side = 0;
     int dim = 0;
     int max_hamming = 0;
@@ -81,17 +82,10 @@ struct PipelineArgs {
     uint32_t* bbox = nullptr;
     uint32_t* candidates = nullptr;
     uint32_t* counts = nullptr;  // [0] candidates, [1] detections, [2] runs, [3] quads
-    uint32_t* contour = nullptr;
     float* quads = nullptr;
     bd_detection* detections = nullptr;
     uint64_t* codes = nullptr;
 };
-
-// Tests bit `local` (0..33) of a 32-bit word pair covering a run of pixels.
-__device__ __forceinline__ bool black_bit(uint32_t lo, uint32_t hi, int local) {
-    const uint32_t word = local < 32 ? lo : hi;
-    return ((word >> (local & 31)) & 1u) == 0u;
-}
 
 // ---------------------------------------------------------------------------
 // 1. Tile threshold
@@ -289,10 +283,11 @@ __global__ void k_find_runs(const uint32_t* __restrict__ bits, int width, int wo
 
     for (int c = warp; c < words; c += warps) {
         const uint32_t mask = row_bits[c];
-        const uint32_t prev = (c == 0) ? 1u : ((row_bits[c - 1] >> 31) & 1u);
-        // Also start a fragment when the previous word ends black: runs may
-        // span 32-pixel chunks and k_merge_runs rejoins the fragments.
-        const uint32_t starts = ~mask & ((mask << 1) | (c == 0 ? 1u : (1u - prev)));
+        // A fragment always starts at bit 0 when that pixel is black: runs may
+        // span 32-pixel chunks, and k_merge_runs rejoins the fragments.  Gating
+        // this on the previous pixel dropped every run that began exactly on a
+        // chunk boundary after white.
+        const uint32_t starts = ~mask & ((mask << 1) | 1u);
         if (lane == 0) chunk_counts[c] = __popc(starts);
     }
     __syncthreads();
@@ -312,10 +307,11 @@ __global__ void k_find_runs(const uint32_t* __restrict__ bits, int width, int wo
 
     for (int c = warp; c < words; c += warps) {
         const uint32_t mask = row_bits[c];
-        const uint32_t prev = (c == 0) ? 1u : ((row_bits[c - 1] >> 31) & 1u);
-        // Also start a fragment when the previous word ends black: runs may
-        // span 32-pixel chunks and k_merge_runs rejoins the fragments.
-        const uint32_t starts = ~mask & ((mask << 1) | (c == 0 ? 1u : (1u - prev)));
+        // A fragment always starts at bit 0 when that pixel is black: runs may
+        // span 32-pixel chunks, and k_merge_runs rejoins the fragments.  Gating
+        // this on the previous pixel dropped every run that began exactly on a
+        // chunk boundary after white.
+        const uint32_t starts = ~mask & ((mask << 1) | 1u);
         if ((starts & (1u << lane)) == 0u) continue;
 
         const int s = lane;
@@ -474,111 +470,58 @@ __device__ __forceinline__ uint32_t pack_point(int x, int y) {
     return (static_cast<uint32_t>(x) & 0xffffu) | (static_cast<uint32_t>(y) << 16);
 }
 
-__device__ int find_region_start(const uint32_t* runs, const uint32_t* row_count,
-                                 uint32_t* parent, int row_cap, uint32_t root, int bx0,
-                                 int by0, int bx1, int width, int* out_y) {
-    const int n = static_cast<int>(row_count[by0]);
-    const uint32_t* row_runs = runs + static_cast<size_t>(by0) * row_cap;
-    int lo = 0;
-    int hi = n - 1;
-    int first = n;
-    while (lo <= hi) {
-        const int mid = (lo + hi) >> 1;
-        if (static_cast<int>(row_runs[mid] >> 16) >= bx0) {
-            first = mid;
-            hi = mid - 1;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    const uint32_t base = static_cast<uint32_t>(by0 * row_cap);
-    for (int k = first; k < n; ++k) {
-        const uint32_t run = row_runs[k];
-        const int x0 = static_cast<int>(run & 0xffffu);
-        const int x1 = static_cast<int>(run >> 16);
-        if (x0 > bx1) break;
-        if (x1 < bx0) continue;
-        if (uf_find(parent, base + k) == root) {
-            *out_y = by0;
-            return max(x0, bx0);
-        }
-    }
-    return -1;
+__device__ __forceinline__ uint32_t uf_root_readonly(const uint32_t* parent, uint32_t x) {
+    // Read-only walk: the block follows parent links from many threads at once,
+    // so this one must not path-compress.  Labels only ever move to smaller
+    // slot indices, so the walk terminates at the root without a hop limit.
+    while (parent[x] != x) x = parent[x];
+    return x;
 }
 
-// Moore-neighbour trace of the outer boundary, clockwise in image coordinates.
-// Returns the number of points, or -1 if the trace was truncated.
-//
-// A step only needs the 3x3 neighbourhood, so the three rows around the current
-// pixel are loaded as word pairs once and every neighbour is a register test.
-// The straightforward version issued up to eight guarded dependent loads per
-// step, which cost about a thousand cycles per contour point.
-__device__ int trace_contour(const uint32_t* bits, int words, int width, int height, int sx,
-                             int sy, uint32_t* out, int capacity) {
-    const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
-    const int dy[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+// Leftmost and rightmost pixel of the component in every sampled bbox row,
+// packed as x | y << 16.  The outer boundary of a tag border is convex, so each
+// of its four corners is the extreme pixel of some row; the convex hull of
+// these points is the border quad.  Collecting them costs one pass over the
+// bbox rows spread across the block, replacing the serial pixel trace.
+__device__ void collect_row_extremes(const uint32_t* runs, const uint32_t* row_count,
+                                     const uint32_t* parent, int row_cap, uint32_t root,
+                                     int bx0, int bx1, int y0, int rows, int kept,
+                                     uint32_t* out, int tid, int nthreads) {
+    for (int s = tid; s < kept; s += nthreads) {
+        const int y = y0 + (kept > 1 ? (s * (rows - 1)) / (kept - 1) : 0);
+        const int n = static_cast<int>(row_count[y]);
+        const uint32_t* row_runs = runs + static_cast<size_t>(y) * row_cap;
 
-    int px = sx;
-    int py = sy;
-    int bdir = 4;  // west neighbour is background at the topmost-leftmost pixel
-    int n = 0;
-    for (int step = 0; step < capacity; ++step) {
-        out[n++] = pack_point(px, py);
-        if (px < 1 || py < 1 || px >= width - 1 || py >= height - 1) return 0;
-
-        const int left_word = (px - 1) >> 5;
-        const int right_word = (px + 1) >> 5;
-        const int lx = px - (left_word << 5);
-        const uint32_t* top = bits + static_cast<size_t>(py - 1) * words;
-        const uint32_t* mid = bits + static_cast<size_t>(py) * words;
-        const uint32_t* bot = bits + static_cast<size_t>(py + 1) * words;
-        uint32_t tl, tr, ml, mr, bl, br;
-        if (left_word == right_word) {
-            // The 3x3 neighbourhood fits in one word per row almost always.
-            tl = tr = top[left_word];
-            ml = mr = mid[left_word];
-            bl = br = bot[left_word];
-        } else {
-            tl = top[left_word];
-            tr = top[right_word];
-            ml = mid[left_word];
-            mr = mid[right_word];
-            bl = bot[left_word];
-            br = bot[right_word];
+        // First run that can reach the component's bounding box, then only the
+        // runs that belong to this component.
+        int lo = 0;
+        int hi = n - 1;
+        int first = n;
+        while (lo <= hi) {
+            const int mid = (lo + hi) >> 1;
+            if (static_cast<int>(row_runs[mid] >> 16) >= bx0) {
+                first = mid;
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
+            }
         }
 
-        const uint32_t black_mask =
-            (static_cast<uint32_t>(black_bit(ml, mr, lx + 1)) << 0) |
-            (static_cast<uint32_t>(black_bit(bl, br, lx + 1)) << 1) |
-            (static_cast<uint32_t>(black_bit(bl, br, lx)) << 2) |
-            (static_cast<uint32_t>(black_bit(bl, br, lx - 1)) << 3) |
-            (static_cast<uint32_t>(black_bit(ml, mr, lx - 1)) << 4) |
-            (static_cast<uint32_t>(black_bit(tl, tr, lx - 1)) << 5) |
-            (static_cast<uint32_t>(black_bit(tl, tr, lx)) << 6) |
-            (static_cast<uint32_t>(black_bit(tl, tr, lx + 1)) << 7);
-
-        // Scan clockwise from the direction after the backtrack: rotate the
-        // 8-bit mask so bit 0 is that direction, then take the first set bit.
-        const int start = (bdir + 1) & 7;
-        const uint32_t scan =
-            ((black_mask >> start) | (black_mask << (8 - start))) & 0xffu;
-        const int first = __ffs(scan);
-        if (first == 0) return 0;
-        const int dir = (bdir + first) & 7;
-        bdir = (dir + 4) & 7;
-        px += dx[dir];
-        py += dy[dir];
-        if (px == sx && py == sy) return n;
+        const uint32_t base = static_cast<uint32_t>(y * row_cap);
+        int left = -1;
+        int right = -1;
+        for (int k = first; k < n; ++k) {
+            const uint32_t run = row_runs[k];
+            const int x0 = static_cast<int>(run & 0xffffu);
+            const int x1 = static_cast<int>(run >> 16);
+            if (x0 > bx1) break;
+            if (uf_root_readonly(parent, base + static_cast<uint32_t>(k)) != root) continue;
+            left = left < 0 ? x0 : min(left, x0);
+            right = right < 0 ? x1 : max(right, x1);
+        }
+        out[2 * s] = left < 0 ? 0xffffffffu : pack_point(left, y);
+        out[2 * s + 1] = right < 0 ? 0xffffffffu : pack_point(right, y);
     }
-    return -1;
-}
-
-__device__ __forceinline__ void contour_point(const uint32_t* contour, int n, int index,
-                                              float* x, float* y) {
-    const int m = (index == n) ? 0 : index;
-    const uint32_t p = contour[m];
-    *x = static_cast<float>(p & 0xffffu);
-    *y = static_cast<float>(p >> 16);
 }
 
 __device__ float point_segment_distance(float px, float py, float ax, float ay, float bx,
@@ -595,106 +538,21 @@ __device__ float point_segment_distance(float px, float py, float ax, float ay, 
     return sqrtf(ex * ex + ey * ey);
 }
 
-__device__ bool simplify_to_quad(const uint32_t* contour, int n, float tolerance,
-                                 float quad[4][2]) {
-    if (n < 8) return false;
+// Reduces the ordered hull to four corners by repeatedly dropping the
+// shallowest vertex, then applies the same sanity checks the traced-contour
+// path used (convex, no needle shapes).  Corners are pushed slightly outward
+// because they start on black pixel centres, half a pixel inside the real
+// edge; the edge fit below turns that estimate into subpixel lines.
+__device__ bool hull_to_quad(const uint32_t* hull, int count, float quad[4][2]) {
+    if (count < 4 || count > kMaxHullVertices) return false;
 
-    float x0, y0;
-    contour_point(contour, n, 0, &x0, &y0);
-    int farthest = 1;
-    float best_d2 = -1.0f;
-    for (int m = 1; m < n; ++m) {
-        float x, y;
-        contour_point(contour, n, m, &x, &y);
-        const float dx = x - x0;
-        const float dy = y - y0;
-        const float d2 = dx * dx + dy * dy;
-        if (d2 > best_d2) {
-            best_d2 = d2;
-            farthest = m;
-        }
-    }
-    if (best_d2 < 16.0f) return false;
-
-    constexpr int kMaxVertices = 128;
-    int poly[kMaxVertices];
-    int np = 0;
-    poly[np++] = 0;
-
-    int stack_i[kMaxVertices];
-    int stack_j[kMaxVertices];
-    for (int seg = 0; seg < 2; ++seg) {
-        int sp = 0;
-        stack_i[sp] = (seg == 0) ? 0 : farthest;
-        stack_j[sp] = (seg == 0) ? farthest : n;
-        ++sp;
-
-        while (sp > 0) {
-            --sp;
-            const int i = stack_i[sp];
-            const int j = stack_j[sp];
-            if (j <= i) continue;
-
-            float ax, ay, bx, by;
-            contour_point(contour, n, i, &ax, &ay);
-            contour_point(contour, n, j, &bx, &by);
-            const float dx = bx - ax;
-            const float dy = by - ay;
-            const float len2 = dx * dx + dy * dy;
-            // One reciprocal square root per segment instead of one per point;
-            // this loop is the hot spot of the whole fit.
-            const float inv_len = len2 > 1e-6f ? rsqrtf(len2) : 0.0f;
-
-            int k = -1;
-            float dmax = 0.0f;
-            for (int m = i + 1; m < j; ++m) {
-                float px, py;
-                contour_point(contour, n, m, &px, &py);
-                float d;
-                if (inv_len == 0.0f) {
-                    const float ex = px - ax;
-                    const float ey = py - ay;
-                    d = sqrtf(ex * ex + ey * ey);
-                } else {
-                    d = fabsf((px - ax) * dy - (py - ay) * dx) * inv_len;
-                }
-                if (d > dmax) {
-                    dmax = d;
-                    k = m;
-                }
-            }
-
-            if (k < 0 || dmax <= tolerance) {
-                if (j < n) {
-                    if (np >= kMaxVertices) return false;
-                    poly[np++] = j;
-                }
-            } else {
-                if (sp + 2 > kMaxVertices) return false;
-                stack_i[sp] = k;
-                stack_j[sp] = j;
-                ++sp;
-                stack_i[sp] = i;
-                stack_j[sp] = k;
-                ++sp;
-            }
-        }
+    float vx[kMaxHullVertices];
+    float vy[kMaxHullVertices];
+    for (int i = 0; i < count; ++i) {
+        vx[i] = static_cast<float>(hull[i] & 0xffffu);
+        vy[i] = static_cast<float>(hull[i] >> 16);
     }
 
-    float vx[kMaxVertices];
-    float vy[kMaxVertices];
-    int count = 0;
-    for (int i = 0; i < np; ++i) {
-        float x, y;
-        contour_point(contour, n, poly[i], &x, &y);
-        vx[count] = x;
-        vy[count] = y;
-        ++count;
-    }
-    if (count < 4) return false;
-
-    // Collapse down to four vertices, always removing the least significant
-    // bump. This keeps the four dominant corners of a perspective quad.
     while (count > 4) {
         int best = -1;
         float best_area = FLT_MAX;
@@ -736,7 +594,6 @@ __device__ bool simplify_to_quad(const uint32_t* contour, int n, float tolerance
         }
     }
 
-    // Convexity and sane corner angles.
     float min_side = FLT_MAX;
     float max_side = 0.0f;
     float perimeter = 0.0f;
@@ -764,17 +621,16 @@ __device__ bool simplify_to_quad(const uint32_t* contour, int n, float tolerance
     }
     if (max_side > 12.0f * min_side) return false;
 
-    // Every contour point must lie close to one of the four quad edges;
-    // otherwise this is a blob, a circle, or an L-shape, not a tag.
-    for (int m = 0; m < n; ++m) {
-        float px, py;
-        contour_point(contour, n, m, &px, &py);
-        float best = FLT_MAX;
-        for (int i = 0; i < 4; ++i) {
-            const int j = (i + 1) & 3;
-            best = fminf(best, point_segment_distance(px, py, vx[i], vy[i], vx[j], vy[j]));
+    const float cx = 0.25f * (vx[0] + vx[1] + vx[2] + vx[3]);
+    const float cy = 0.25f * (vy[0] + vy[1] + vy[2] + vy[3]);
+    for (int i = 0; i < 4; ++i) {
+        const float dx = vx[i] - cx;
+        const float dy = vy[i] - cy;
+        const float len = sqrtf(dx * dx + dy * dy);
+        if (len > 1e-3f) {
+            vx[i] += dx / len * 0.65f;
+            vy[i] += dy / len * 0.65f;
         }
-        if (best > fmaxf(3.0f, 0.02f * perimeter)) return false;
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -812,10 +668,29 @@ __device__ bool intersect_lines(const float li[4], const float lj[4], float* x, 
     return true;
 }
 
-// Fits one edge of the quad to gradient samples.  The four edges are
-// independent, so k_fit_quads runs this one edge per thread.
-__device__ bool fit_edge_line(const float quad[4][2], int edge, const uint8_t* image,
-                              int width, int height, int stride, int dim, float line[4]) {
+// Signed intensity rise across a point along a unit direction: positive when
+// the image is brighter on the +direction side.  Scoring the *outward* rise
+// instead of the gradient magnitude lets the search cross a full cell without
+// ever snapping to the inner border edge, which has the opposite sign.
+__device__ __forceinline__ float directional_rise(const uint8_t* image, int width, int height,
+                                                  int stride, float x, float y, float dx,
+                                                  float dy) {
+    const float ahead = sample_bilinear(image, width, height, stride, x + dx * 0.7f,
+                                        y + dy * 0.7f);
+    const float behind = sample_bilinear(image, width, height, stride, x - dx * 0.7f,
+                                         y - dy * 0.7f);
+    if (ahead < 0.0f || behind < 0.0f) return 0.0f;
+    return ahead - behind;
+}
+
+// Fits one edge of the quad to gradient samples.  A warp handles an edge: each
+// lane probes one position along it, the moments are reduced with shuffles and
+// lane 0 turns them into a line.  The gradient peak found on the coarse grid is
+// refined with a parabola through its two neighbours, so a sample sits on the
+// edge to a fraction of a pixel instead of on the quarter-step grid.
+__device__ bool fit_edge_line_warp(const float quad[4][2], int edge, const uint8_t* image,
+                                   int width, int height, int stride, int dim,
+                                   bool first_pass, int lane, float line[4]) {
     const int b = (edge + 1) & 3;
     const float ax = quad[edge][0];
     const float ay = quad[edge][1];
@@ -826,50 +701,82 @@ __device__ bool fit_edge_line(const float quad[4][2], int edge, const uint8_t* i
     const float len = sqrtf(ex * ex + ey * ey);
     if (len < 8.0f) return false;
 
-    const float nx = -ey / len;
-    const float ny = ex / len;
+    // Outward normal.  Quads arrive with positive winding (area2 > 0), for
+    // which (-ey, ex) points into the tag, so (ey, -ex) points out.
+    const float nx = ey / len;
+    const float ny = -ex / len;
     const float cell = len / static_cast<float>(dim);
-    const float range = fminf(fmaxf(0.35f * cell, 0.5f), 2.5f);
-    const int samples = min(max(static_cast<int>(len / 8.0f), 6), 20);
+    // A sharp corner is anti-aliased away over up to ~1.5 cells, so the pixel
+    // hull can sit that far inside the real edge.  The first pass searches a
+    // full cell to recover that; the inner border edge is ignored because its
+    // outward rise is negative.  The second pass starts on the recovered edge
+    // and narrows the window again, which keeps the subpixel error down.
+    const float range = first_pass ? fminf(fmaxf(0.95f * cell, 1.5f), 4.5f)
+                                   : fminf(fmaxf(0.30f * cell, 0.8f), 2.0f);
+    // Keep the probe spacing near half a pixel so the parabola below still
+    // lands on the edge to a fraction of a pixel when the range is wide.
+    const int half = max(2, static_cast<int>(ceilf(range / 0.6f)));
+    const int probes = 2 * half + 1;
+    const float step = range / static_cast<float>(half);
+    const int samples = min(max(static_cast<int>(len / 4.0f), 8), 32);
 
     float mx = 0.0f;
     float my = 0.0f;
     float mxx = 0.0f;
     float mxy = 0.0f;
     float myy = 0.0f;
-    int used = 0;        for (int s = 1; s <= samples; ++s) {
-            const float alpha = static_cast<float>(s) / static_cast<float>(samples + 1);
-            const float px = ax + alpha * ex;
-            const float py = ay + alpha * ey;
-            float best_mag = 0.0f;
-            float best_t = 0.0f;
-            for (int step = -4; step <= 4; ++step) {
-                const float t = range * static_cast<float>(step) * 0.25f;
-                const float x = px + nx * t;
-                const float y = py + ny * t;
-                const float xp = sample_bilinear(image, width, height, stride, x + 0.7f, y);
-                const float xm = sample_bilinear(image, width, height, stride, x - 0.7f, y);
-                const float yp = sample_bilinear(image, width, height, stride, x, y + 0.7f);
-                const float ym = sample_bilinear(image, width, height, stride, x, y - 0.7f);
-                if (xp < 0.0f || xm < 0.0f || yp < 0.0f || ym < 0.0f) continue;
-                const float gx = xp - xm;
-                const float gy = yp - ym;
-                const float mag = sqrtf(gx * gx + gy * gy);
-                if (mag > best_mag) {
-                    best_mag = mag;
-                    best_t = t;
+    int used = 0;
+
+    if (lane < samples) {
+        const float alpha = static_cast<float>(lane + 1) / static_cast<float>(samples + 1);
+        const float px = ax + alpha * ex;
+        const float py = ay + alpha * ey;
+        float best_mag = 0.0f;
+        int best = -1;
+        for (int i = 0; i < probes; ++i) {
+            const float t = step * static_cast<float>(i - half);
+            const float mag = directional_rise(image, width, height, stride, px + nx * t,
+                                               py + ny * t, nx, ny);
+            if (mag > best_mag) {
+                best_mag = mag;
+                best = i;
+            }
+        }
+        if (best >= 0 && best_mag >= 6.0f) {
+            float t = step * static_cast<float>(best - half);
+            if (best > 0 && best < probes - 1) {
+                const float m0 = directional_rise(image, width, height, stride,
+                                                  px + nx * (t - step), py + ny * (t - step),
+                                                  nx, ny);
+                const float m2 = directional_rise(image, width, height, stride,
+                                                  px + nx * (t + step), py + ny * (t + step),
+                                                  nx, ny);
+                const float den = m0 - 2.0f * best_mag + m2;
+                if (den < -1e-3f) {
+                    t += fminf(fmaxf(0.5f * (m0 - m2) / den, -0.5f), 0.5f) * step;
                 }
             }
-            if (best_mag < 6.0f) continue;
-        const float x = px + nx * best_t;
-        const float y = py + ny * best_t;
-        mx += x;
-        my += y;
-        mxx += x * x;
-        mxy += x * y;
-        myy += y * y;
-        ++used;
+            const float x = px + nx * t;
+            const float y = py + ny * t;
+            mx = x;
+            my = y;
+            mxx = x * x;
+            mxy = x * y;
+            myy = y * y;
+            used = 1;
+        }
     }
+
+    const unsigned mask = 0xffffffffu;
+    for (int off = 16; off > 0; off >>= 1) {
+        mx += __shfl_down_sync(mask, mx, off);
+        my += __shfl_down_sync(mask, my, off);
+        mxx += __shfl_down_sync(mask, mxx, off);
+        mxy += __shfl_down_sync(mask, mxy, off);
+        myy += __shfl_down_sync(mask, myy, off);
+        used += __shfl_down_sync(mask, used, off);
+    }
+    if (lane != 0) return true;
     if (used < 4) return false;
 
     const float inv = 1.0f / static_cast<float>(used);
@@ -904,7 +811,11 @@ __device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
         const int j = (i + 1) & 3;
         extent = fmaxf(extent, hypotf(quad[j][0] - quad[i][0], quad[j][1] - quad[i][1]));
     }
-    const float max_shift = fminf(fmaxf(3.0f, 0.04f * extent), 10.0f);
+    // A sharp corner can be anti-aliased away over more than a cell, so the
+    // pixel hull has no support for it and only the two fitted lines can
+    // recover it.  Allow that correction; a line that instead locks onto an
+    // inner edge still fails the border/hamming checks downstream.
+    const float max_shift = fminf(fmaxf(0.15f * extent, 4.0f), 16.0f);
 
     for (int i = 0; i < 4; ++i) {
         const int j = (i + 1) & 3;
@@ -938,27 +849,28 @@ __device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
     }
 }
 
-__global__ void k_fit_quads(const uint32_t* __restrict__ bits,
-                            const uint32_t* __restrict__ runs,
+// One block per candidate.  The block collects the component's row extremes,
+// probes the hull in kFitDirections directions and reduces the ordered hull to
+// four corners, then fits the four edges with one warp each.
+__global__ void k_fit_quads(const uint32_t* __restrict__ runs,
                             const uint32_t* __restrict__ row_count,
-                            uint32_t* __restrict__ parent,
+                            const uint32_t* __restrict__ parent,
                             const uint32_t* __restrict__ bbox,
                             const uint32_t* __restrict__ candidates,
                             uint32_t* __restrict__ counts,
                             const uint8_t* __restrict__ gray, int width, int height, int stride,
-                            int words, int row_cap, int max_candidates, int contour_cap,
-                            int dim, int refine_edges,
-                            uint32_t* __restrict__ contour, float* __restrict__ quads) {
-    __shared__ float traced_quad[4][2];
+                            int row_cap, int max_candidates, int dim, int refine_edges,
+                            float* __restrict__ quads) {
+    __shared__ uint32_t boundary[2 * kMaxBoundaryRows];
+    __shared__ float probe_dot[kFitWarps][kFitDirections];
+    __shared__ uint32_t probe_point[kFitWarps][kFitDirections];
+    __shared__ uint32_t extreme[kFitDirections];
+    __shared__ float fit_quad[4][2];
     __shared__ float edge_lines[4][4];
     __shared__ int edge_have[4];
-    __shared__ int have_quad;
-    __shared__ int contour_n;
-    __shared__ uint32_t shared_contour[kSharedContourPoints];
+    __shared__ int quad_ok;
+    __shared__ uint32_t hull[kFitDirections];
 
-    // One block per candidate: candidates are few (tens), and a single block
-    // per candidate spreads them across SMs instead of serialising them on the
-    // two SMs that a single 128-thread block would use.
     const int ci = blockIdx.x;
     if (ci >= max_candidates) return;
 
@@ -974,89 +886,117 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ bits,
     const int y0 = static_cast<int>(bbox[root * 4 + 1]);
     const int x1 = static_cast<int>(bbox[root * 4 + 2]);
     const int y1 = static_cast<int>(bbox[root * 4 + 3]);
+    const int rows = y1 - y0 + 1;
+    const int kept = min(rows, kMaxBoundaryRows);
+    const int points = 2 * kept;
 
-    // Union-find is only read now; keep it on one thread instead of letting the
-    // whole block race through parent path-halving before the trace starts.
-    if (threadIdx.x == 0) {
-        int sy = 0;
-        const int sx = find_region_start(runs, row_count, parent, row_cap, root, x0, y0, x1,
-                                         width, &sy);
-        int n = 0;
-        if (sx >= 0) {
-            uint32_t* points = contour + static_cast<size_t>(ci) * contour_cap;
-            n = trace_contour(bits, words, width, height, sx, sy, points, contour_cap);
-        }
-        contour_n = n;
+    for (int i = threadIdx.x; i < 2 * kMaxBoundaryRows; i += blockDim.x) {
+        boundary[i] = 0xffffffffu;
     }
     __syncthreads();
+    collect_row_extremes(runs, row_count, parent, row_cap, root, x0, x1, y0, rows, kept,
+                         boundary, threadIdx.x, blockDim.x);
+    __syncthreads();
 
-    uint32_t* points = contour + static_cast<size_t>(ci) * contour_cap;
-    const int n = contour_n;
-    const bool cached = n >= 8 && n <= kSharedContourPoints;
-    // Every second contour point is enough to locate the four corners, and it
-    // halves the polygon-simplification work on long contours.
-    const bool decimate = cached && n > 256;
-    const int kept = decimate ? (n + 1) / 2 : n;
-    if (cached) {
-        for (int i = threadIdx.x; i < kept; i += blockDim.x) {
-            shared_contour[i] = points[decimate ? i * 2 : i];
+    // Extreme boundary point in each probe direction, split over the four
+    // warps.  For a convex outline these are hull vertices in traversal order.
+    const int dir = threadIdx.x & 31;
+    const int part = threadIdx.x >> 5;
+    const int chunk = (points + kFitWarps - 1) / kFitWarps;
+    const int begin = part * chunk;
+    const int end = min(points, begin + chunk);
+    const float angle =
+        6.28318530718f * static_cast<float>(dir) / static_cast<float>(kFitDirections);
+    const float ux = cosf(angle);
+    const float uy = sinf(angle);
+    float best_dot = -FLT_MAX;
+    uint32_t best_point = 0xffffffffu;
+    for (int i = begin; i < end; ++i) {
+        const uint32_t p = boundary[i];
+        if (p == 0xffffffffu) continue;
+        const float d = static_cast<float>(p & 0xffffu) * ux +
+                        static_cast<float>(p >> 16) * uy;
+        if (d > best_dot) {
+            best_dot = d;
+            best_point = p;
         }
     }
+    probe_dot[part][dir] = best_dot;
+    probe_point[part][dir] = best_point;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        bool ok = n >= 8;
-        if (ok) {
-            const float tolerance =
-                fmaxf(1.5f, 0.015f * static_cast<float>(max(x1 - x0, y1 - y0)));
-            float quad[4][2];
-            ok = simplify_to_quad(cached ? shared_contour : points, cached ? kept : n, tolerance,
-                                  quad);
-            if (ok) {
-                // The trace lives on black pixel centres, half a pixel inside
-                // the true edge. Move corners outward before refinement.
-                const float cx = 0.25f * (quad[0][0] + quad[1][0] + quad[2][0] + quad[3][0]);
-                const float cy = 0.25f * (quad[0][1] + quad[1][1] + quad[2][1] + quad[3][1]);
-                for (int i = 0; i < 4; ++i) {
-                    const float dx = quad[i][0] - cx;
-                    const float dy = quad[i][1] - cy;
-                    const float len = sqrtf(dx * dx + dy * dy);
-                    if (len > 1e-3f) {
-                        quad[i][0] += dx / len * 0.65f;
-                        quad[i][1] += dy / len * 0.65f;
-                    }
-                }
-                for (int i = 0; i < 4; ++i) {
-                    traced_quad[i][0] = quad[i][0];
-                    traced_quad[i][1] = quad[i][1];
-                }
+
+    if (threadIdx.x < kFitDirections) {
+        float best = -FLT_MAX;
+        uint32_t point = 0xffffffffu;
+        for (int p = 0; p < kFitWarps; ++p) {
+            if (probe_dot[p][threadIdx.x] > best) {
+                best = probe_dot[p][threadIdx.x];
+                point = probe_point[p][threadIdx.x];
             }
         }
-        have_quad = ok ? 1 : 0;
-        for (int i = 0; i < 4; ++i) edge_have[i] = 0;
+        extreme[threadIdx.x] = point;
     }
     __syncthreads();
-    if (!have_quad) return;
 
-    if (refine_edges && threadIdx.x < 4) {
-        edge_have[threadIdx.x] =
-            fit_edge_line(traced_quad, threadIdx.x, gray, width, height, stride, dim,
-                          edge_lines[threadIdx.x])
-                ? 1
-                : 0;
+    if (threadIdx.x == 0) {
+        int hc = 0;
+        for (int i = 0; i < kFitDirections; ++i) {
+            const uint32_t p = extreme[i];
+            if (p == 0xffffffffu) continue;
+            if (hc > 0 && hull[hc - 1] == p) continue;
+            hull[hc++] = p;
+        }
+        while (hc > 1 && hull[0] == hull[hc - 1]) --hc;
+
+        float quad[4][2];
+        const bool ok = hull_to_quad(hull, hc, quad);
+        quad_ok = ok ? 1 : 0;
+        if (ok) {
+            for (int i = 0; i < 4; ++i) {
+                fit_quad[i][0] = quad[i][0];
+                fit_quad[i][1] = quad[i][1];
+            }
+        }
     }
     __syncthreads();
+    if (!quad_ok) return;
+
+    if (refine_edges) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        // Two passes: the first starts from the pixel hull, the second samples
+        // along lines already sitting on the edges, which sharpens the corners.
+        for (int iteration = 0; iteration < kFitIterations; ++iteration) {
+            float line[4];
+            const bool ok = fit_edge_line_warp(fit_quad, warp, gray, width, height, stride,
+                                               dim, iteration == 0, lane, line);
+            if (lane == 0) {
+                edge_have[warp] = ok ? 1 : 0;
+                if (ok) {
+                    for (int k = 0; k < 4; ++k) edge_lines[warp][k] = line[k];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float quad[4][2];
+                for (int i = 0; i < 4; ++i) {
+                    quad[i][0] = fit_quad[i][0];
+                    quad[i][1] = fit_quad[i][1];
+                }
+                apply_refined_lines(quad, edge_lines, edge_have);
+                for (int i = 0; i < 4; ++i) {
+                    fit_quad[i][0] = quad[i][0];
+                    fit_quad[i][1] = quad[i][1];
+                }
+            }
+            __syncthreads();
+        }
+    }
+
     if (threadIdx.x != 0) return;
-
-    float quad[4][2];
     for (int i = 0; i < 4; ++i) {
-        quad[i][0] = traced_quad[i][0];
-        quad[i][1] = traced_quad[i][1];
-    }
-    if (refine_edges) apply_refined_lines(quad, edge_lines, edge_have);
-
-    for (int i = 0; i < 4; ++i) {
-        out[i * 2 + 0] = quad[i][0];
-        out[i * 2 + 1] = quad[i][1];
+        out[i * 2 + 0] = fit_quad[i][0];
+        out[i * 2 + 1] = fit_quad[i][1];
     }
     atomicAdd(&counts[3], 1u);
 }
@@ -1460,11 +1400,10 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
                             a.width, a.min_cluster_pixels, a.min_tag_pixels,
                             a.max_candidates, a.candidates, a.counts, a.row_active));
 
-    BD_STAGE("fit_quads", k_fit_quads<<<a.max_candidates, 32, 0, stream>>>(
-                              a.bits, a.runs, a.row_count, a.parent, a.bbox, a.candidates,
-                              a.counts, a.gray, a.width, a.height, a.stride, a.words,
-                              a.row_cap, a.max_candidates, a.contour_cap, a.dim,
-                              a.refine_edges, a.contour, a.quads));
+    BD_STAGE("fit_quads", k_fit_quads<<<a.max_candidates, kFitThreads, 0, stream>>>(
+                              a.runs, a.row_count, a.parent, a.bbox, a.candidates,
+                              a.counts, a.gray, a.width, a.height, a.stride, a.row_cap,
+                              a.max_candidates, a.dim, a.refine_edges, a.quads));
 
     BD_STAGE("decode", k_decode_quads<<<a.max_candidates, 32, 0, stream>>>(
                            a.gray, a.width, a.height, a.stride, a.quads, a.counts,
@@ -1581,7 +1520,6 @@ struct GpuDetector::Impl {
     uint32_t* d_bbox = nullptr;
     uint32_t* d_candidates = nullptr;
     uint32_t* d_counts = nullptr;
-    uint32_t* d_contour = nullptr;
     float* d_quads = nullptr;
     bd_detection* d_detections = nullptr;
     uint64_t* d_codes = nullptr;
@@ -1637,7 +1575,6 @@ struct GpuDetector::Impl {
         BD_FREE_DEV(d_bbox);
         BD_FREE_DEV(d_candidates);
         BD_FREE_DEV(d_counts);
-        BD_FREE_DEV(d_contour);
         BD_FREE_DEV(d_quads);
         BD_FREE_DEV(d_detections);
         BD_FREE_DEV(d_codes);
@@ -1686,8 +1623,6 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     args.min_cluster_pixels = std::max(cfg.min_cluster_pixels, 1);
     args.min_tag_pixels = std::max(cfg.min_tag_pixels, 4);
     args.max_candidates = max_candidates;
-    args.contour_cap = std::min(std::max(2 * (width + height), kMinContourCapacity),
-                                kMaxContourCapacity);
     args.bits_per_side = family->bits_per_side;
     args.dim = family->bits_per_side + 2 * family->border_cells;
     args.max_hamming = hamming;
@@ -1724,10 +1659,6 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_candidates),
                             static_cast<size_t>(max_candidates) * sizeof(uint32_t), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_counts), 5 * sizeof(uint32_t), error);
-    ok = ok && device_alloc(reinterpret_cast<void**>(&d_contour),
-                            static_cast<size_t>(max_candidates) * args.contour_cap *
-                                sizeof(uint32_t),
-                            error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_quads),
                             static_cast<size_t>(max_candidates) * 8 * sizeof(float), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_detections),
@@ -1776,7 +1707,6 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     args.bbox = d_bbox;
     args.candidates = d_candidates;
     args.counts = d_counts;
-    args.contour = d_contour;
     args.quads = d_quads;
     args.detections = d_detections;
     args.codes = d_codes;

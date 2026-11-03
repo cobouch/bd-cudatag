@@ -31,9 +31,13 @@ Each frame runs as one CUDA graph with pinned host staging:
    lock-free union-find.
 4. **Candidate filtering.** Components are filtered by area, bounding-box size,
    border contact, aspect ratio and fill.
-5. **Quad fitting.** The outer contour is traced with Moore-neighbour tracing,
-   simplified to four dominant corners, and (optionally) refined against image
-   gradients. Contour points are stored as packed 16-bit coordinates.
+5. **Quad fitting.** Each candidate is one block. It collects the leftmost and
+   rightmost component pixel of every row in its bounding box (in parallel),
+   probes those points in 32 directions to recover the convex hull, and reduces
+   the hull to four corners. Each of the four edges is then fitted to gradient
+   peaks by one warp, with a parabolic subpixel peak and a second refinement
+   pass. This replaced a serial Moore contour trace plus Douglas-Peucker
+   simplification, which dominated frame time.
 6. **Decoding.** The quad is sampled with a homography for all four rotations,
    matched against the family code table by popcount, and scored by decision
    margin. No decoding or corner work happens for frames with no candidates.
@@ -112,37 +116,37 @@ resolution (`quad_decimate=1.0`, `refine_edges=1`, one thread).
 
 | Resolution | Detector | Median (ms) | p95 (ms) | Tags found | Corner error (px) | Wrong IDs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 640x480 | bdcudatag | 0.50 | 0.56 | 99.6% | 0.24 | 0 |
-| 640x480 | NAPA | 0.28 | 0.38 | 99.6% | 0.10 | 0 |
-| 640x480 | NAPA (min_tag_px=16) | 0.55 | 0.65 | 100.0% | 0.10 | 0 |
-| 640x480 | ArUco (subpixel) | 1.15 | 1.41 | 99.6% | 0.30 | 0 |
-| 640x480 | AprilTag 3 (full res) | 2.11 | 2.34 | 100.0% | 0.71 | 0 |
-| 1280x720 | bdcudatag | 0.70 | 0.94 | 100.0% | 0.26 | 0 |
-| 1280x720 | NAPA | 0.47 | 0.52 | 100.0% | 0.15 | 0 |
-| 1280x720 | NAPA (min_tag_px=16) | 1.34 | 1.48 | 100.0% | 0.15 | 0 |
-| 1280x720 | ArUco (subpixel) | 2.34 | 3.03 | 100.0% | 0.29 | 0 |
-| 1280x720 | AprilTag 3 (full res) | 5.71 | 8.11 | 100.0% | 0.71 | 0 |
-| 1280x800 | bdcudatag | 0.83 | 4.13 | 99.6% | 0.25 | 0 |
-| 1280x800 | NAPA | 0.50 | 0.70 | 100.0% | 0.16 | 0 |
-| 1280x800 | NAPA (min_tag_px=16) | 2.35 | 2.49 | 100.0% | 0.16 | 0 |
-| 1280x800 | ArUco (subpixel) | 2.94 | 3.58 | 100.0% | 0.30 | 0 |
-| 1280x800 | AprilTag 3 (full res) | 7.29 | 9.54 | 100.0% | 0.72 | 0 |
-| 1920x1080 | bdcudatag | 1.14 | 7.52 | 99.2% | 0.32 | 0 |
-| 1920x1080 | NAPA | 0.79 | 1.11 | 100.0% | 0.23 | 0 |
-| 1920x1080 | NAPA (min_tag_px=16) | 2.56 | 3.54 | 100.0% | 0.23 | 0 |
-| 1920x1080 | ArUco (subpixel) | 5.12 | 5.92 | 100.0% | 0.33 | 0 |
-| 1920x1080 | AprilTag 3 (full res) | 11.91 | 15.29 | 100.0% | 0.72 | 0 |
+| 640x480 | bdcudatag | 0.28 | 0.31 | 100.0% | 0.13 | 0 |
+| 640x480 | NAPA | 0.24 | 0.27 | 99.6% | 0.10 | 0 |
+| 640x480 | NAPA (min_tag_px=16) | 0.54 | 0.77 | 100.0% | 0.10 | 0 |
+| 640x480 | ArUco (subpixel) | 1.13 | 1.36 | 99.6% | 0.30 | 0 |
+| 640x480 | AprilTag 3 (full res) | 2.02 | 2.25 | 100.0% | 0.71 | 0 |
+| 1280x720 | bdcudatag | 0.39 | 0.43 | 100.0% | 0.16 | 0 |
+| 1280x720 | NAPA | 0.44 | 0.50 | 100.0% | 0.15 | 0 |
+| 1280x720 | NAPA (min_tag_px=16) | 1.32 | 1.41 | 100.0% | 0.15 | 0 |
+| 1280x720 | ArUco (subpixel) | 2.59 | 3.21 | 100.0% | 0.29 | 0 |
+| 1280x720 | AprilTag 3 (full res) | 6.05 | 8.20 | 100.0% | 0.71 | 0 |
+| 1280x800 | bdcudatag | 0.39 | 3.03 | 100.0% | 0.17 | 0 |
+| 1280x800 | NAPA | 0.51 | 0.75 | 100.0% | 0.16 | 0 |
+| 1280x800 | NAPA (min_tag_px=16) | 1.49 | 2.08 | 100.0% | 0.16 | 0 |
+| 1280x800 | ArUco (subpixel) | 2.74 | 3.32 | 100.0% | 0.30 | 0 |
+| 1280x800 | AprilTag 3 (full res) | 6.51 | 8.72 | 100.0% | 0.72 | 0 |
+| 1920x1080 | bdcudatag | 0.58 | 3.89 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA | 0.78 | 1.06 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA (min_tag_px=16) | 2.64 | 3.69 | 100.0% | 0.23 | 0 |
+| 1920x1080 | ArUco (subpixel) | 5.37 | 5.99 | 100.0% | 0.33 | 0 |
+| 1920x1080 | AprilTag 3 (full res) | 12.12 | 16.44 | 100.0% | 0.72 | 0 |
 
-NAPA is still the fastest and most corner-accurate detector here: bdcudatag is
-about 1.7x slower at 1280x800 (0.83 vs 0.50 ms) and 1.4x slower at 1920x1080
-(1.14 vs 0.79 ms). bdcudatag is now 3.5x faster than ArUco at 1280x800 and 4.5x
-faster at 1920x1080, and 4-10x faster than full-resolution AprilTag. Its corner
-error (0.24-0.32 px) is slightly better than ArUco's and behind NAPA's. No
-detector decoded a decoy, so the wrong-id column is zero throughout;
-bdcudatag's lower recall is one missed tag out of 256 at 1280x800 and two at
-1920x1080. The p95 numbers for bdcudatag in this table include occasional
-host-side stalls in the Python harness; the native benchmark, which times only
-`detect`, reports p95 of 0.77 ms at 1280x800 and 1.10 ms at 1920x1080.
+bdcudatag is the fastest detector at 1280x720 (0.39 vs 0.44 ms for NAPA), at
+1280x800 (0.39 vs 0.51 ms) and at 1920x1080 (0.58 vs 0.78 ms). Its corner error
+matches NAPA's at 720p and 1080p (0.16 and 0.23 px) and is 0.01 px higher at
+800p. At 640x480 NAPA is still slightly faster (0.24 vs 0.28 ms) and slightly
+more accurate (0.10 vs 0.13 px), but it misses one tag where bdcudatag finds
+all 256. The 3.03 ms p95 at 1280x800 and 3.89 ms at 1920x1080 are host stalls in
+the Python process (the native benchmark measures 0.37 and 0.54 ms p95).
+bdcudatag is 4-10x faster than ArUco and 7-21x faster than full-resolution
+AprilTag. No detector decoded a decoy, so the wrong-id column is zero
+throughout; bdcudatag finds every tag at every resolution.
 
 `detect` is synchronous and includes host-to-device staging and a device
 synchronization, so these are end-to-end frame times rather than kernel times.
