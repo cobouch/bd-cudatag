@@ -37,19 +37,27 @@ Each frame runs as one CUDA graph with pinned host staging:
    per 32-pixel chunk, joined at chunk boundaries, and merged across rows with a
    lock-free union-find.
 4. **Candidate filtering.** Components are filtered by area, bounding-box size,
-   border contact, aspect ratio and fill.
+   border contact, aspect ratio and fill. Survivors are bucketed by area and
+   flattened largest-first, so when a noisy or dense frame produces more
+   candidates than the cap, the small specks and glyphs are dropped instead of
+   whichever components the atomic counter happened to see first.
 5. **Quad fitting.** Each candidate is one block. It collects the leftmost and
    rightmost component pixel of every row in its bounding box (in parallel),
    probes those points in 32 directions to recover the convex hull, and reduces
    the hull to four corners. Each of the four edges is then fitted to gradient
    peaks by one warp, with a parabolic subpixel peak and a second refinement
-   pass. This replaced a serial Moore contour trace plus Douglas-Peucker
-   simplification, which dominated frame time.
+   pass. The first pass searches a full cell either way and, when the profile
+   has two peaks, takes the inner one: a tag on a surface whose brightness sits
+   between its black and white cells binarizes with a one-cell halo, and the
+   hull then starts outside the black square. This replaced a serial Moore
+   contour trace plus Douglas-Peucker simplification, which dominated frame time.
 6. **Decoding.** The quad is sampled with a homography for all four rotations,
    matched against the family code table by popcount, and scored by decision
    margin. One warp decodes one candidate and eight warps share a block, so the
    grid is not padded to `max_candidates`. No decoding or corner work happens
-   for frames with no candidates.
+   for frames with no candidates. The unrefined hull is decoded as well and
+   used only when no rotation of the refined quad decodes, so edge refinement
+   can never lose a tag it would otherwise have found.
 
 Everything is allocated at construction time; `detect` does not allocate device
 memory. A CUDA graph is captured on the first host-frame call and replayed
@@ -125,33 +133,33 @@ resolution (`quad_decimate=1.0`, `refine_edges=1`, one thread).
 
 | Resolution | Detector | Median (ms) | p95 (ms) | Tags found | Corner error (px) | Wrong IDs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 640x480 | bdcudatag | 0.31 | 0.34 | 100.0% | 0.13 | 0 |
+| 640x480 | bdcudatag | 0.32 | 0.38 | 100.0% | 0.13 | 0 |
 | 640x480 | NAPA | 0.25 | 0.28 | 99.6% | 0.10 | 0 |
-| 640x480 | NAPA (min_tag_px=16) | 0.55 | 0.59 | 100.0% | 0.10 | 0 |
-| 640x480 | ArUco (subpixel) | 1.13 | 1.36 | 99.6% | 0.30 | 0 |
-| 640x480 | AprilTag 3 (full res) | 2.11 | 2.38 | 100.0% | 0.71 | 0 |
-| 1280x720 | bdcudatag | 0.41 | 0.44 | 100.0% | 0.16 | 0 |
-| 1280x720 | NAPA | 0.47 | 0.52 | 100.0% | 0.15 | 0 |
-| 1280x720 | NAPA (min_tag_px=16) | 1.33 | 1.43 | 100.0% | 0.15 | 0 |
-| 1280x720 | ArUco (subpixel) | 2.30 | 2.94 | 100.0% | 0.29 | 0 |
-| 1280x720 | AprilTag 3 (full res) | 6.11 | 6.62 | 100.0% | 0.71 | 0 |
-| 1280x800 | bdcudatag | 0.44 | 0.49 | 100.0% | 0.17 | 0 |
-| 1280x800 | NAPA | 0.48 | 0.56 | 100.0% | 0.16 | 0 |
-| 1280x800 | NAPA (min_tag_px=16) | 1.41 | 1.50 | 100.0% | 0.16 | 0 |
-| 1280x800 | ArUco (subpixel) | 2.39 | 3.10 | 100.0% | 0.30 | 0 |
-| 1280x800 | AprilTag 3 (full res) | 6.57 | 7.32 | 100.0% | 0.72 | 0 |
-| 1920x1080 | bdcudatag | 0.60 | 0.64 | 100.0% | 0.23 | 0 |
-| 1920x1080 | NAPA | 0.77 | 0.90 | 100.0% | 0.23 | 0 |
-| 1920x1080 | NAPA (min_tag_px=16) | 2.54 | 2.76 | 100.0% | 0.23 | 0 |
-| 1920x1080 | ArUco (subpixel) | 4.49 | 5.79 | 100.0% | 0.33 | 0 |
-| 1920x1080 | AprilTag 3 (full res) | 12.21 | 13.25 | 100.0% | 0.72 | 0 |
+| 640x480 | NAPA (min_tag_px=16) | 0.54 | 0.59 | 100.0% | 0.10 | 0 |
+| 640x480 | ArUco (subpixel) | 1.17 | 1.42 | 99.6% | 0.30 | 0 |
+| 640x480 | AprilTag 3 (full res) | 2.11 | 2.30 | 100.0% | 0.71 | 0 |
+| 1280x720 | bdcudatag | 0.42 | 0.44 | 100.0% | 0.17 | 0 |
+| 1280x720 | NAPA | 0.47 | 0.57 | 100.0% | 0.15 | 0 |
+| 1280x720 | NAPA (min_tag_px=16) | 1.32 | 1.40 | 100.0% | 0.15 | 0 |
+| 1280x720 | ArUco (subpixel) | 2.36 | 3.02 | 100.0% | 0.29 | 0 |
+| 1280x720 | AprilTag 3 (full res) | 8.87 | 10.09 | 100.0% | 0.71 | 0 |
+| 1280x800 | bdcudatag | 0.49 | 0.60 | 100.0% | 0.17 | 0 |
+| 1280x800 | NAPA | 0.72 | 0.85 | 100.0% | 0.16 | 0 |
+| 1280x800 | NAPA (min_tag_px=16) | 2.30 | 2.57 | 100.0% | 0.16 | 0 |
+| 1280x800 | ArUco (subpixel) | 2.90 | 3.54 | 100.0% | 0.30 | 0 |
+| 1280x800 | AprilTag 3 (full res) | 9.69 | 11.09 | 100.0% | 0.72 | 0 |
+| 1920x1080 | bdcudatag | 0.70 | 0.75 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA | 0.87 | 1.20 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA (min_tag_px=16) | 3.03 | 4.56 | 100.0% | 0.23 | 0 |
+| 1920x1080 | ArUco (subpixel) | 5.77 | 6.41 | 100.0% | 0.33 | 0 |
+| 1920x1080 | AprilTag 3 (full res) | 18.47 | 19.89 | 100.0% | 0.72 | 0 |
 
-bdcudatag is the fastest detector at 1280x720 (0.41 vs 0.47 ms for NAPA), at
-1280x800 (0.44 vs 0.48 ms) and at 1920x1080 (0.60 vs 0.77 ms). Its corner error
-matches NAPA's at 720p and 1080p (0.16 and 0.23 px) and is 0.01 px higher at
-800p. At 640x480 NAPA is still slightly faster (0.25 vs 0.31 ms) and slightly
+bdcudatag is the fastest detector at 1280x720 (0.42 vs 0.47 ms for NAPA), at
+1280x800 (0.49 vs 0.72 ms) and at 1920x1080 (0.70 vs 0.87 ms). Its corner error
+matches NAPA's at 1080p (0.23 px) and is 0.01 px higher at 800p and 0.02 px
+higher at 720p. At 640x480 NAPA is still slightly faster (0.25 vs 0.32 ms) and
 more accurate (0.10 vs 0.13 px), but it misses one tag where bdcudatag finds
-all 256. bdcudatag is 3.6-7.5x faster than ArUco and 7-20x faster than
+all 256. bdcudatag is 3.7-8.2x faster than ArUco and 6.6-26x faster than
 full-resolution AprilTag. No detector decoded a decoy, so the wrong-id column is
 zero throughout; bdcudatag finds every tag at every resolution.
 
@@ -171,21 +179,61 @@ cd detector/bench
 
 | Group | Resolution | Tags | Tags found | Corner (px) | Wrong IDs | Mean (ms) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| main | 640x480 | 1811 | 99.4% | 0.03 | 1 | 0.33 |
-| main | 1280x720 | 1888 | 99.4% | 0.03 | 0 | 0.45 |
-| main | 1920x1080 | 1822 | 98.9% | 0.03 | 0 | 0.73 |
-| stress | 640x480 | 1289 | 100.0% | 0.06 | 0 | 0.38 |
-| stress | 1280x720 | 1642 | 99.8% | 0.06 | 0 | 0.58 |
-| stress | 1920x1080 | 1646 | 99.5% | 0.07 | 0 | 0.85 |
-| range | 640x480 | 900 | 100.0% | 0.05 | 0 | 0.26 |
+| main | 640x480 | 1811 | 99.6% | 0.04 | 1 | 0.34 |
+| main | 1280x720 | 1888 | 99.7% | 0.05 | 0 | 0.55 |
+| main | 1920x1080 | 1822 | 99.7% | 0.05 | 0 | 0.85 |
+| stress | 640x480 | 1289 | 100.0% | 0.06 | 0 | 0.42 |
+| stress | 1280x720 | 1642 | 100.0% | 0.06 | 0 | 0.69 |
+| stress | 1920x1080 | 1646 | 100.0% | 0.07 | 0 | 1.02 |
+| range | 640x480 | 900 | 100.0% | 0.05 | 0 | 0.32 |
 
-Across the whole corpus bdcudatag finds 10,944 of 10,998 tags (99.5%) with a
-0.03 px median corner error. The single wrong ID is `decoys-640x480-042`, the
-corpus's documented two-bit collision with id 323; the same frame is NAPA's only
-wrong ID. The full setup now clears every bad-lighting and low-resolution
-scenario. Times are end-to-end `detect` calls, so the 2 MB host-to-device copy
-dominates 1080p; in the standard 32-scene sweep above the mean is 0.42 ms across
-the four resolutions.
+Across the whole corpus bdcudatag finds 10,979 of 10,998 tags (99.8%) with a
+0.05 px median corner error. Every stress and range tag is found, and the 19
+remaining misses are 18 `low-contrast` tags plus one `steep-angle` tag at
+640x480. The single wrong ID is `decoys-640x480-042`, the corpus's documented
+two-bit collision with id 323; the same frame is NAPA's only wrong ID. Times are
+end-to-end `detect` calls, so the 2 MB host-to-device copy dominates 1080p; in
+the standard 32-scene sweep above the mean is 0.44 ms across the four
+resolutions.
+
+### Hard synthetic corpus
+
+NAPA stops at moderately hard conditions, so `gen_synthetic.py` renders a second
+corpus in the same layout for the conditions its `low-contrast` scenario only
+hints at:
+a lifted black level with a narrow dark quiet zone, deep underexposure, heavy
+sensor noise, motion blur, a saturated highlight, and a quiet zone clipped by
+the frame edge. Tags are rendered 4x supersampled from the OpenCV family table,
+and ground-truth corners are the same homography the pixels were drawn through.
+
+```bash
+cd detector/bench
+.venv/Scripts/python gen_synthetic.py --frames 30    # 780 frames, 13 scenarios
+.venv/Scripts/python eval_napa.py --root datasets/synthetic-hard \
+    --markdown synthetic_results.md
+```
+
+| Scenario | 640x480 | 1280x720 | Contents |
+| --- | ---: | ---: | --- |
+| tiny | 100.0% | 100.0% | 10-22 px tags, clean image |
+| lowcontrast | 45.0% | 68.6% | black 96-118, cells 160-182, bg 242 |
+| dark-noisy | 98.2% | 100.0% | background 28-48, cells 52-88, noise 5-9 |
+| noise | 100.0% | 97.7% | noise sigma 15-22 on a textured background |
+| underexposed | 100.0% | 100.0% | exposure 0.22-0.34 |
+| blur | 80.7% | 100.0% | Gaussian sigma 1.1-2.2 on 18-60 px tags |
+| motion | 68.9% | 96.5% | linear motion blur, 6-15 px kernels |
+| jpeg | 100.0% | 98.5% | quality 8-20 |
+| shadow | 100.0% | 100.0% | a shadow edge across the tag |
+| glare | 98.1% | 92.7% | a saturated specular blob |
+| edge | 100.0% | 100.0% | quiet zone clipped by the image border |
+| dense | 99.8% | 99.8% | 12-20 tags of 22-44 px |
+| mixed | 93.5% | 100.0% | dim, noisy, blurred and small together |
+
+Overall 2,293 of 2,389 tags (96.0%) with a 0.27 px median corner error and no
+wrong IDs. This corpus is deliberately harsher than NAPA — its low-contrast
+scenario is still the open problem at 640x480, and it is the regression net for
+further work there — so the numbers are lower by design and are not a
+cross-detector leaderboard.
 
 `detect` is synchronous and includes host-to-device staging and a device
 synchronization, so these are end-to-end frame times rather than kernel times.
@@ -213,6 +261,7 @@ name, so the table can be regenerated one detector at a time:
 cd detector/bench
 python -m venv --system-site-packages .venv
 .venv/Scripts/python -m pip install -r requirements.txt      # .venv/bin/python on Linux
+.venv/Scripts/python gen_synthetic.py --frames 30            # hard corpus, no GPU required
 .venv/Scripts/python compare_detectors.py --scenes scenes --frames 200 \
     --markdown results.md
 ```

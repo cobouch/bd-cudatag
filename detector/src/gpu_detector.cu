@@ -47,6 +47,7 @@ constexpr int kFitDirections = 32;      // hull probe directions
 constexpr int kMaxBoundaryRows = 1024;  // bbox rows kept per candidate
 constexpr int kMaxHullVertices = 64;
 constexpr int kFitIterations = 2;  // edge-line re-fits per candidate
+constexpr int kFitProbeHalf = 24;   // probe steps each side, 49 samples max
 
 struct PipelineArgs {
     const uint8_t* gray = nullptr;
@@ -87,8 +88,11 @@ struct PipelineArgs {
     uint32_t* area = nullptr;
     uint32_t* bbox = nullptr;
     uint32_t* candidates = nullptr;
+    uint32_t* candidate_bins = nullptr;  // 64 area buckets, max_candidates each
+    uint32_t* bin_counts = nullptr;      // 64
     uint32_t* counts = nullptr;  // [0] candidates, [1] detections, [2] runs, [3] quads
     float* quads = nullptr;
+    float* hull_quads = nullptr;  // pre-refinement quad, the decode fallback
     bd_detection* detections = nullptr;
     uint64_t* codes = nullptr;
 };
@@ -589,7 +593,8 @@ __global__ void k_collect_candidates(const uint32_t* __restrict__ row_count,
                                      const uint32_t* __restrict__ area,
                                      const uint32_t* __restrict__ bbox, int row_cap,
                                      int height, int width, int min_area, int min_tag_px,
-                                     int max_candidates, uint32_t* __restrict__ candidates,
+                                     int max_candidates, uint32_t* __restrict__ bins,
+                                     uint32_t* __restrict__ bin_counts,
                                      uint32_t* __restrict__ counts,
                                      const uint8_t* __restrict__ row_active) {
     const int y = (blockIdx.x * kMergeWarps) + (threadIdx.x >> 5);
@@ -618,8 +623,33 @@ __global__ void k_collect_candidates(const uint32_t* __restrict__ row_count,
         const float fill = static_cast<float>(a) / static_cast<float>(bw * bh);
         if (fill < 0.18f || fill > 0.95f) continue;
 
-        const uint32_t slot = atomicAdd(&counts[0], 1u);
-        if (slot < static_cast<uint32_t>(max_candidates)) candidates[slot] = idx;
+        // Rank by area instead of by whichever component the atomic counter
+        // saw first.  A capped list then drops the smallest components (noise
+        // specks, text fragments) instead of dropping real tags, which is what
+        // used to happen on noisy and dense 1080p frames.
+        const int log2_area = 31 - __clz(static_cast<uint32_t>(a));
+        const int bin = 63 - min(log2_area, 63);
+        const uint32_t slot = atomicAdd(&bin_counts[bin], 1u);
+        atomicAdd(&counts[0], 1u);
+        if (slot < static_cast<uint32_t>(max_candidates)) {
+            bins[bin * max_candidates + slot] = idx;
+        }
+    }
+}
+
+// Flattens the area buckets into `candidates`, largest component first, so the
+// fit and decode grids can stay capped without losing tags.
+__global__ void k_order_candidates(const uint32_t* __restrict__ bins,
+                                   const uint32_t* __restrict__ bin_counts,
+                                   uint32_t* __restrict__ candidates, int max_candidates,
+                                   const uint32_t* __restrict__ counts) {
+    if (threadIdx.x != 0) return;
+    const uint32_t limit = min(counts[0], static_cast<uint32_t>(max_candidates));
+    uint32_t pos = 0;
+    for (int bin = 0; bin < 64 && pos < limit; ++bin) {
+        const uint32_t n = min(bin_counts[bin], limit - pos);
+        for (uint32_t i = 0; i < n; ++i) candidates[pos + i] = bins[bin * max_candidates + i];
+        pos += n;
     }
 }
 
@@ -871,14 +901,23 @@ __device__ bool fit_edge_line_warp(const float quad[4][2], int edge, const uint8
     // full cell to recover that; the inner border edge is ignored because its
     // outward rise is negative.  The second pass starts on the recovered edge
     // and narrows the window again, which keeps the subpixel error down.
-    const float range = first_pass ? fminf(fmaxf(0.95f * cell, 1.5f), 4.5f)
+    //
+    // The first pass has to reach one full cell *outward* as well.  When a tag
+    // sits on a surface whose brightness is between its black and white cells
+    // (a lifted black level, or a dim quiet zone), the binarizer keeps the
+    // quiet zone black too, so the hull starts a cell outside the black square.
+    // A 4.5 px window never reached that edge on anything larger than 36 px.
+    const float range = first_pass ? fminf(fmaxf(1.15f * cell, 1.5f), 2.5f * cell)
                                    : fminf(fmaxf(0.30f * cell, 0.8f), 2.0f);
-    // Keep the probe spacing near half a pixel so the parabola below still
-    // lands on the edge to a fraction of a pixel when the range is wide.
-    const int half = max(2, static_cast<int>(ceilf(range / 0.6f)));
+    // Keep the probe spacing near three quarters of a pixel so the parabola
+    // below still lands on the edge to a fraction of a pixel over a wide range.
+    const int half = min(max(2, static_cast<int>(ceilf(range / 0.75f))), kFitProbeHalf);
     const int probes = 2 * half + 1;
     const float step = range / static_cast<float>(half);
-    const int samples = min(max(static_cast<int>(len / 4.0f), 8), 32);
+    // A wide search range multiplies the probe count, so cap the number of
+    // points along the edge: sixteen still over-determines a line fit, and
+    // small tags keep the eight points their short edges need.
+    const int samples = min(max(static_cast<int>(len / 6.0f), 8), 16);
 
     float mx = 0.0f;
     float my = 0.0f;
@@ -891,15 +930,38 @@ __device__ bool fit_edge_line_warp(const float quad[4][2], int edge, const uint8
         const float alpha = static_cast<float>(lane + 1) / static_cast<float>(samples + 1);
         const float px = ax + alpha * ex;
         const float py = ay + alpha * ey;
+        float mags[kFitProbeHalf * 2 + 1];
         float best_mag = 0.0f;
         int best = -1;
         for (int i = 0; i < probes; ++i) {
             const float t = step * static_cast<float>(i - half);
             const float mag = directional_rise(image, width, height, stride, px + nx * t,
                                                py + ny * t, nx, ny);
+            mags[i] = mag;
             if (mag > best_mag) {
                 best_mag = mag;
                 best = i;
+            }
+        }
+        // Probes run from inward (-range) to outward (+range).  When the hull
+        // sits outside the black square, the profile has two separate peaks:
+        // the tag border and the quiet-zone/background edge further out.  Pick
+        // the inner peak in that case.  A single soft edge also rises across
+        // several probes, but it has no valley after its peak, so normal tags
+        // keep the accurate peak instead of sliding inward along the slope.
+        if (first_pass && best > 2) {
+            const float accept = 0.70f * best_mag;
+            for (int i = 1; i + 1 < best; ++i) {
+                if (mags[i] < accept || mags[i] < mags[i - 1] || mags[i] < mags[i + 1]) {
+                    continue;
+                }
+                float valley = FLT_MAX;
+                for (int k = i + 1; k < best; ++k) valley = fminf(valley, mags[k]);
+                if (valley < 0.5f * mags[i]) {
+                    best = i;
+                    best_mag = mags[i];
+                    break;
+                }
             }
         }
         if (best >= 0 && best_mag >= 6.0f) {
@@ -1024,7 +1086,7 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ runs,
                             uint32_t* __restrict__ counts,
                             const uint8_t* __restrict__ gray, int width, int height, int stride,
                             int row_cap, int max_candidates, int dim, int refine_edges,
-                            float* __restrict__ quads) {
+                            float* __restrict__ quads, float* __restrict__ hull_quads) {
     __shared__ uint32_t boundary[2 * kMaxBoundaryRows];
     __shared__ float probe_dot[kFitWarps][kFitDirections];
     __shared__ uint32_t probe_point[kFitWarps][kFitDirections];
@@ -1040,9 +1102,13 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ runs,
     if (ci >= max_candidates) return;
 
     float* out = quads + ci * 8;
+    float* hull_out = hull_quads + ci * 8;
     if (threadIdx.x == 0) {
         const float nan_value = __int_as_float(0x7fc00000);
-        for (int i = 0; i < 8; ++i) out[i] = nan_value;
+        for (int i = 0; i < 8; ++i) {
+            out[i] = nan_value;
+            hull_out[i] = nan_value;
+        }
     }
     if (ci >= static_cast<int>(counts[0])) return;
 
@@ -1120,6 +1186,11 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ runs,
             for (int i = 0; i < 4; ++i) {
                 fit_quad[i][0] = quad[i][0];
                 fit_quad[i][1] = quad[i][1];
+                // The unrefined hull is kept as a decode fallback: a blurred
+                // or motion-smeared edge can pull a fitted line away from the
+                // real corner, and the hull still carries the tag's code.
+                hull_out[i * 2 + 0] = quad[i][0];
+                hull_out[i * 2 + 1] = quad[i][1];
             }
         }
     }
@@ -1369,7 +1440,8 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
                                uint32_t* __restrict__ counts, int max_candidates, int dim,
                                const uint64_t* __restrict__ codes, int code_count,
                                int max_hamming, float sharpening, float min_margin,
-                               bd_detection* __restrict__ detections, int max_detections) {
+                               bd_detection* __restrict__ detections, int max_detections,
+                               const float* __restrict__ hull_quads) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int ci = blockIdx.x * kDecodeWarps + warp;
@@ -1384,6 +1456,12 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
         quad[i][0] = q[i * 2 + 0];
         quad[i][1] = q[i * 2 + 1];
     }
+    const float* hull = hull_quads + ci * 8;
+    float hull_quad[4][2];
+    for (int i = 0; i < 4; ++i) {
+        hull_quad[i][0] = hull[i * 2 + 0];
+        hull_quad[i][1] = hull[i * 2 + 1];
+    }
 
     // The four rotations are independent: one lane decodes each, then the warp
     // picks the same winner the serial loop used to (highest score, first
@@ -1394,18 +1472,22 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
         float margin;
         float corners[4][2];
     };
-    __shared__ RotationResult results[kDecodeWarps][4];
+    // Eight lanes: four rotations of the refined quad then four of the hull.
+    __shared__ RotationResult results[kDecodeWarps][8];
 
-    if (lane < 4) {
+    if (lane < 8) {
+        const int variant = lane >> 2;
+        const int rotation = lane & 3;
+        const float(*source)[2] = variant == 0 ? quad : hull_quad;
         RotationResult& result = results[warp][lane];
         result.id = -1;
         int id = 0;
         int hamming = 0;
         float margin = 0.0f;
         float corners[4][2];
-        if (decode_quad(gray, width, height, stride, 0, 0, quad, dim, lane, codes, code_count,
-                        max_hamming, sharpening, min_margin, &id, &hamming, &margin,
-                        corners)) {
+        if (decode_quad(gray, width, height, stride, 0, 0, source, dim, rotation, codes,
+                        code_count, max_hamming, sharpening, min_margin, &id, &hamming,
+                        &margin, corners)) {
             result.id = id;
             result.hamming = hamming;
             result.margin = margin;
@@ -1419,15 +1501,23 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
 
     if (lane != 0) return;
 
+    // The refined quad is always preferred: it is what gives subpixel corners,
+    // and its margin is not comparable to the hull's (the hull samples pixel
+    // centres and often shows more contrast, which used to win the tie and
+    // cost accuracy).  The hull is a strict fallback for tags whose fitted
+    // lines were pulled off the real border by blur or a dark quiet zone.
     int best = -1;
     float best_score = -1.0f;
-    for (int r = 0; r < 4; ++r) {
-        if (results[warp][r].id < 0) continue;
-        const float score = static_cast<float>(4 - results[warp][r].hamming) * 1000.0f +
-                            results[warp][r].margin;
-        if (score > best_score) {
-            best_score = score;
-            best = r;
+    for (int variant = 0; variant < 2 && best < 0; ++variant) {
+        for (int rotation = 0; rotation < 4; ++rotation) {
+            const int r = variant * 4 + rotation;
+            if (results[warp][r].id < 0) continue;
+            const float score = static_cast<float>(4 - results[warp][r].hamming) * 1000.0f +
+                                results[warp][r].margin;
+            if (score > best_score) {
+                best_score = score;
+                best = r;
+            }
         }
     }
     if (best < 0) return;
@@ -1538,7 +1628,8 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
     BD_STAGE("memset", cudaMemsetAsync(a.counts, 0, 5 * sizeof(uint32_t), stream));
     BD_STAGE("memset_hist",
              (cudaMemsetAsync(a.span_hist, 0, 256 * sizeof(uint32_t), stream),
-              cudaMemsetAsync(a.mean_hist, 0, 256 * sizeof(uint32_t), stream)));
+              cudaMemsetAsync(a.mean_hist, 0, 256 * sizeof(uint32_t), stream),
+              cudaMemsetAsync(a.bin_counts, 0, 64 * sizeof(uint32_t), stream)));
 
     const int tile_count = a.tile_w * a.tile_h;
     const int tile_threads = 128;
@@ -1583,12 +1674,18 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
     BD_STAGE("collect", k_collect_candidates<<<row_grid, kMergeThreads, 0, stream>>>(
                             a.row_count, a.parent, a.area, a.bbox, a.row_cap, a.height,
                             a.width, a.min_cluster_pixels, a.min_tag_pixels,
-                            a.max_candidates, a.candidates, a.counts, a.row_active));
+                            a.max_candidates, a.candidate_bins, a.bin_counts, a.counts,
+                            a.row_active));
+
+    BD_STAGE("order_candidates", k_order_candidates<<<1, 1, 0, stream>>>(
+                                     a.candidate_bins, a.bin_counts, a.candidates,
+                                     a.max_candidates, a.counts));
 
     BD_STAGE("fit_quads", k_fit_quads<<<a.max_candidates, kFitThreads, 0, stream>>>(
                               a.runs, a.row_count, a.parent, a.bbox, a.candidates,
                               a.counts, a.gray, a.width, a.height, a.stride, a.row_cap,
-                              a.max_candidates, a.dim, a.refine_edges, a.quads));
+                              a.max_candidates, a.dim, a.refine_edges, a.quads,
+                              a.hull_quads));
 
     BD_STAGE("decode",
              k_decode_quads<<<(a.max_candidates + kDecodeWarps - 1) / kDecodeWarps,
@@ -1596,7 +1693,7 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
                            a.gray, a.width, a.height, a.stride, a.quads, a.counts,
                            a.max_candidates, a.dim, a.codes, a.code_count, a.max_hamming,
                            a.sharpening, a.min_decision_margin, a.detections,
-                           a.max_detections));
+                           a.max_detections, a.hull_quads));
 
     const size_t final_smem = static_cast<size_t>(a.max_detections) * sizeof(bd_detection);
     BD_STAGE("finalize", k_finalize<<<1, 1, final_smem, stream>>>(a.detections, a.counts,
@@ -1712,8 +1809,11 @@ struct GpuDetector::Impl {
     uint32_t* d_area = nullptr;
     uint32_t* d_bbox = nullptr;
     uint32_t* d_candidates = nullptr;
+    uint32_t* d_candidate_bins = nullptr;
+    uint32_t* d_bin_counts = nullptr;
     uint32_t* d_counts = nullptr;
     float* d_quads = nullptr;
+    float* d_hull_quads = nullptr;
     bd_detection* d_detections = nullptr;
     uint64_t* d_codes = nullptr;
 
@@ -1773,8 +1873,11 @@ struct GpuDetector::Impl {
         BD_FREE_DEV(d_area);
         BD_FREE_DEV(d_bbox);
         BD_FREE_DEV(d_candidates);
+        BD_FREE_DEV(d_candidate_bins);
+        BD_FREE_DEV(d_bin_counts);
         BD_FREE_DEV(d_counts);
         BD_FREE_DEV(d_quads);
+        BD_FREE_DEV(d_hull_quads);
         BD_FREE_DEV(d_detections);
         BD_FREE_DEV(d_codes);
 #undef BD_FREE_DEV
@@ -1809,9 +1912,15 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     const int height = cfg.height;
     // The cap bounds candidate collection, so it decides recall on dense
     // frames; the 1080p dense scenes really do produce more than 384.
+    // Ranked candidate collection only drops the smallest components when the
+    // list overflows, so the cap can stay generous: 192 / 384 / 768 at 640p /
+    // 720p / 1080p.  It bounds the fit and decode grids, not recall.
     max_candidates = cfg.max_candidates > 0
                          ? std::min(std::max(cfg.max_candidates, 16), 1024)
-                         : std::min(std::max(next_power_of_two((width * height) / 4096), 64), 1024);
+                         : std::min(std::max(next_power_of_two((width * height) / 4096) *
+                                                 3 / 2,
+                                             96),
+                                    1024);
 
     args.width = width;
     args.height = height;
@@ -1870,8 +1979,15 @@ bool GpuDetector::Impl::initialize(std::string* error) {
                             error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_candidates),
                             static_cast<size_t>(max_candidates) * sizeof(uint32_t), error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_candidate_bins),
+                            static_cast<size_t>(max_candidates) * 64 * sizeof(uint32_t),
+                            error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_bin_counts), 64 * sizeof(uint32_t),
+                            error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_counts), 5 * sizeof(uint32_t), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_quads),
+                            static_cast<size_t>(max_candidates) * 8 * sizeof(float), error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_hull_quads),
                             static_cast<size_t>(max_candidates) * 8 * sizeof(float), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_detections),
                             static_cast<size_t>(max_detections) * sizeof(bd_detection), error);
@@ -1924,8 +2040,11 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     args.area = d_area;
     args.bbox = d_bbox;
     args.candidates = d_candidates;
+    args.candidate_bins = d_candidate_bins;
+    args.bin_counts = d_bin_counts;
     args.counts = d_counts;
     args.quads = d_quads;
+    args.hull_quads = d_hull_quads;
     args.detections = d_detections;
     args.codes = d_codes;
 
