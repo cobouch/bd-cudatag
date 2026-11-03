@@ -62,6 +62,12 @@ if(BDCUDATAG_BUILD_BENCHMARKS)
     target_link_libraries(bdcudatag_bench PRIVATE bdcudatag)
     target_include_directories(bdcudatag_bench PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+    # Exports scenes for compare_detectors.py.  No detector or CUDA dependency:
+    # it only renders tags from the family tables.
+    add_executable(bdcudatag_scenes bench/scene_gen.cpp)
+    target_include_directories(bdcudatag_scenes PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 endif()
 
 install(TARGETS bdcudatag

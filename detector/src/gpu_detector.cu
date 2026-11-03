@@ -23,6 +23,8 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -40,6 +42,9 @@ constexpr int kMergeWarps = 4;
 constexpr int kMergeThreads = kMergeWarps * 32;
 constexpr int kMinContourCapacity = 2048;
 constexpr int kMaxContourCapacity = 16384;
+// Contours up to this length are copied to shared memory before polygon
+// simplification, which reads the same points many times.
+constexpr int kSharedContourPoints = 8192;
 
 struct PipelineArgs {
     const uint8_t* gray = nullptr;
@@ -82,12 +87,10 @@ struct PipelineArgs {
     uint64_t* codes = nullptr;
 };
 
-__device__ __forceinline__ bool is_white(const uint32_t* bits, int words, int x, int y) {
-    return ((bits[y * words + (x >> 5)] >> (x & 31)) & 1u) != 0u;
-}
-
-__device__ __forceinline__ bool is_black(const uint32_t* bits, int words, int x, int y) {
-    return !is_white(bits, words, x, y);
+// Tests bit `local` (0..33) of a 32-bit word pair covering a run of pixels.
+__device__ __forceinline__ bool black_bit(uint32_t lo, uint32_t hi, int local) {
+    const uint32_t word = local < 32 ? lo : hi;
+    return ((word >> (local & 31)) & 1u) == 0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +508,11 @@ __device__ int find_region_start(const uint32_t* runs, const uint32_t* row_count
 
 // Moore-neighbour trace of the outer boundary, clockwise in image coordinates.
 // Returns the number of points, or -1 if the trace was truncated.
+//
+// A step only needs the 3x3 neighbourhood, so the three rows around the current
+// pixel are loaded as word pairs once and every neighbour is a register test.
+// The straightforward version issued up to eight guarded dependent loads per
+// step, which cost about a thousand cycles per contour point.
 __device__ int trace_contour(const uint32_t* bits, int words, int width, int height, int sx,
                              int sy, uint32_t* out, int capacity) {
     const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
@@ -516,18 +524,47 @@ __device__ int trace_contour(const uint32_t* bits, int words, int width, int hei
     int n = 0;
     for (int step = 0; step < capacity; ++step) {
         out[n++] = pack_point(px, py);
-        int dir = -1;
-        for (int k = 1; k <= 8; ++k) {
-            const int d = (bdir + k) & 7;
-            const int nx = px + dx[d];
-            const int ny = py + dy[d];
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            if (is_black(bits, words, nx, ny)) {
-                dir = d;
-                break;
-            }
+        if (px < 1 || py < 1 || px >= width - 1 || py >= height - 1) return 0;
+
+        const int left_word = (px - 1) >> 5;
+        const int right_word = (px + 1) >> 5;
+        const int lx = px - (left_word << 5);
+        const uint32_t* top = bits + static_cast<size_t>(py - 1) * words;
+        const uint32_t* mid = bits + static_cast<size_t>(py) * words;
+        const uint32_t* bot = bits + static_cast<size_t>(py + 1) * words;
+        uint32_t tl, tr, ml, mr, bl, br;
+        if (left_word == right_word) {
+            // The 3x3 neighbourhood fits in one word per row almost always.
+            tl = tr = top[left_word];
+            ml = mr = mid[left_word];
+            bl = br = bot[left_word];
+        } else {
+            tl = top[left_word];
+            tr = top[right_word];
+            ml = mid[left_word];
+            mr = mid[right_word];
+            bl = bot[left_word];
+            br = bot[right_word];
         }
-        if (dir < 0) return 0;
+
+        const uint32_t black_mask =
+            (static_cast<uint32_t>(black_bit(ml, mr, lx + 1)) << 0) |
+            (static_cast<uint32_t>(black_bit(bl, br, lx + 1)) << 1) |
+            (static_cast<uint32_t>(black_bit(bl, br, lx)) << 2) |
+            (static_cast<uint32_t>(black_bit(bl, br, lx - 1)) << 3) |
+            (static_cast<uint32_t>(black_bit(ml, mr, lx - 1)) << 4) |
+            (static_cast<uint32_t>(black_bit(tl, tr, lx - 1)) << 5) |
+            (static_cast<uint32_t>(black_bit(tl, tr, lx)) << 6) |
+            (static_cast<uint32_t>(black_bit(tl, tr, lx + 1)) << 7);
+
+        // Scan clockwise from the direction after the backtrack: rotate the
+        // 8-bit mask so bit 0 is that direction, then take the first set bit.
+        const int start = (bdir + 1) & 7;
+        const uint32_t scan =
+            ((black_mask >> start) | (black_mask << (8 - start))) & 0xffu;
+        const int first = __ffs(scan);
+        if (first == 0) return 0;
+        const int dir = (bdir + first) & 7;
         bdir = (dir + 4) & 7;
         px += dx[dir];
         py += dy[dir];
@@ -604,6 +641,9 @@ __device__ bool simplify_to_quad(const uint32_t* contour, int n, float tolerance
             const float dx = bx - ax;
             const float dy = by - ay;
             const float len2 = dx * dx + dy * dy;
+            // One reciprocal square root per segment instead of one per point;
+            // this loop is the hot spot of the whole fit.
+            const float inv_len = len2 > 1e-6f ? rsqrtf(len2) : 0.0f;
 
             int k = -1;
             float dmax = 0.0f;
@@ -611,12 +651,12 @@ __device__ bool simplify_to_quad(const uint32_t* contour, int n, float tolerance
                 float px, py;
                 contour_point(contour, n, m, &px, &py);
                 float d;
-                if (len2 < 1e-6f) {
+                if (inv_len == 0.0f) {
                     const float ex = px - ax;
                     const float ey = py - ay;
                     d = sqrtf(ex * ex + ey * ey);
                 } else {
-                    d = fabsf((px - ax) * dy - (py - ay) * dx) / sqrtf(len2);
+                    d = fabsf((px - ax) * dy - (py - ay) * dx) * inv_len;
                 }
                 if (d > dmax) {
                     dmax = d;
@@ -772,37 +812,32 @@ __device__ bool intersect_lines(const float li[4], const float lj[4], float* x, 
     return true;
 }
 
-__device__ void refine_quad(const uint8_t* image, int width, int height, int stride,
-                            float quad[4][2], int dim) {
-    float lines[4][4];
-    bool have[4] = {false, false, false, false};
+// Fits one edge of the quad to gradient samples.  The four edges are
+// independent, so k_fit_quads runs this one edge per thread.
+__device__ bool fit_edge_line(const float quad[4][2], int edge, const uint8_t* image,
+                              int width, int height, int stride, int dim, float line[4]) {
+    const int b = (edge + 1) & 3;
+    const float ax = quad[edge][0];
+    const float ay = quad[edge][1];
+    const float bx = quad[b][0];
+    const float by = quad[b][1];
+    const float ex = bx - ax;
+    const float ey = by - ay;
+    const float len = sqrtf(ex * ex + ey * ey);
+    if (len < 8.0f) return false;
 
-    for (int edge = 0; edge < 4; ++edge) {
-        const int a = edge;
-        const int b = (edge + 1) & 3;
-        const float ax = quad[a][0];
-        const float ay = quad[a][1];
-        const float bx = quad[b][0];
-        const float by = quad[b][1];
-        const float ex = bx - ax;
-        const float ey = by - ay;
-        const float len = sqrtf(ex * ex + ey * ey);
-        if (len < 8.0f) continue;
+    const float nx = -ey / len;
+    const float ny = ex / len;
+    const float cell = len / static_cast<float>(dim);
+    const float range = fminf(fmaxf(0.35f * cell, 0.5f), 2.5f);
+    const int samples = min(max(static_cast<int>(len / 8.0f), 6), 20);
 
-        const float nx = -ey / len;
-        const float ny = ex / len;
-        const float cell = len / static_cast<float>(dim);
-        const float range = fminf(fmaxf(0.35f * cell, 0.5f), 2.5f);
-        const int samples = min(max(static_cast<int>(len / 8.0f), 6), 20);
-
-        float mx = 0.0f;
-        float my = 0.0f;
-        float mxx = 0.0f;
-        float mxy = 0.0f;
-        float myy = 0.0f;
-        int used = 0;
-
-        for (int s = 1; s <= samples; ++s) {
+    float mx = 0.0f;
+    float my = 0.0f;
+    float mxx = 0.0f;
+    float mxy = 0.0f;
+    float myy = 0.0f;
+    int used = 0;        for (int s = 1; s <= samples; ++s) {
             const float alpha = static_cast<float>(s) / static_cast<float>(samples + 1);
             const float px = ax + alpha * ex;
             const float py = ay + alpha * ey;
@@ -826,31 +861,35 @@ __device__ void refine_quad(const uint8_t* image, int width, int height, int str
                 }
             }
             if (best_mag < 6.0f) continue;
-            const float x = px + nx * best_t;
-            const float y = py + ny * best_t;
-            mx += x;
-            my += y;
-            mxx += x * x;
-            mxy += x * y;
-            myy += y * y;
-            ++used;
-        }
-        if (used < 4) continue;
-
-        const float inv = 1.0f / static_cast<float>(used);
-        const float cx = mx * inv;
-        const float cy = my * inv;
-        const float cxx = mxx * inv - cx * cx;
-        const float cxy = mxy * inv - cx * cy;
-        const float cyy = myy * inv - cy * cy;
-        const float theta = 0.5f * atan2f(2.0f * cxy, cxx - cyy);
-        lines[edge][0] = cx;
-        lines[edge][1] = cy;
-        lines[edge][2] = -sinf(theta);
-        lines[edge][3] = cosf(theta);
-        have[edge] = true;
+        const float x = px + nx * best_t;
+        const float y = py + ny * best_t;
+        mx += x;
+        my += y;
+        mxx += x * x;
+        mxy += x * y;
+        myy += y * y;
+        ++used;
     }
+    if (used < 4) return false;
 
+    const float inv = 1.0f / static_cast<float>(used);
+    const float cx = mx * inv;
+    const float cy = my * inv;
+    const float cxx = mxx * inv - cx * cx;
+    const float cxy = mxy * inv - cx * cy;
+    const float cyy = myy * inv - cy * cy;
+    const float theta = 0.5f * atan2f(2.0f * cxy, cxx - cyy);
+    line[0] = cx;
+    line[1] = cy;
+    line[2] = -sinf(theta);
+    line[3] = cosf(theta);
+    return true;
+}
+
+// Intersects the fitted edge lines and keeps the result when every corner
+// stays close to the traced quad and the quad remains convex.
+__device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
+                                    const int have[4]) {
     int line_count = 0;
     for (int i = 0; i < 4; ++i) line_count += have[i] ? 1 : 0;
     if (line_count < 3) return;
@@ -908,14 +947,26 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ bits,
                             uint32_t* __restrict__ counts,
                             const uint8_t* __restrict__ gray, int width, int height, int stride,
                             int words, int row_cap, int max_candidates, int contour_cap,
-                            int dim, int refine_edges, uint32_t* __restrict__ contour,
-                            float* __restrict__ quads) {
-    const int ci = blockIdx.x * blockDim.x + threadIdx.x;
+                            int dim, int refine_edges,
+                            uint32_t* __restrict__ contour, float* __restrict__ quads) {
+    __shared__ float traced_quad[4][2];
+    __shared__ float edge_lines[4][4];
+    __shared__ int edge_have[4];
+    __shared__ int have_quad;
+    __shared__ int contour_n;
+    __shared__ uint32_t shared_contour[kSharedContourPoints];
+
+    // One block per candidate: candidates are few (tens), and a single block
+    // per candidate spreads them across SMs instead of serialising them on the
+    // two SMs that a single 128-thread block would use.
+    const int ci = blockIdx.x;
     if (ci >= max_candidates) return;
 
     float* out = quads + ci * 8;
-    const float nan_value = __int_as_float(0x7fc00000);
-    for (int i = 0; i < 8; ++i) out[i] = nan_value;
+    if (threadIdx.x == 0) {
+        const float nan_value = __int_as_float(0x7fc00000);
+        for (int i = 0; i < 8; ++i) out[i] = nan_value;
+    }
     if (ci >= static_cast<int>(counts[0])) return;
 
     const uint32_t root = candidates[ci];
@@ -924,33 +975,84 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ bits,
     const int x1 = static_cast<int>(bbox[root * 4 + 2]);
     const int y1 = static_cast<int>(bbox[root * 4 + 3]);
 
-    int sy = 0;
-    const int sx = find_region_start(runs, row_count, parent, row_cap, root, x0, y0, x1, width,
-                                     &sy);
-    if (sx < 0) return;
+    // Union-find is only read now; keep it on one thread instead of letting the
+    // whole block race through parent path-halving before the trace starts.
+    if (threadIdx.x == 0) {
+        int sy = 0;
+        const int sx = find_region_start(runs, row_count, parent, row_cap, root, x0, y0, x1,
+                                         width, &sy);
+        int n = 0;
+        if (sx >= 0) {
+            uint32_t* points = contour + static_cast<size_t>(ci) * contour_cap;
+            n = trace_contour(bits, words, width, height, sx, sy, points, contour_cap);
+        }
+        contour_n = n;
+    }
+    __syncthreads();
 
     uint32_t* points = contour + static_cast<size_t>(ci) * contour_cap;
-    const int n = trace_contour(bits, words, width, height, sx, sy, points, contour_cap);
-    if (n < 8) return;
-
-    const float tolerance = fmaxf(1.5f, 0.015f * static_cast<float>(max(x1 - x0, y1 - y0)));
-    float quad[4][2];
-    if (!simplify_to_quad(points, n, tolerance, quad)) return;
-
-    // The trace lives on black pixel centres, half a pixel inside the true
-    // edge. Move corners outward before the optional gradient refinement.
-    float cx = 0.25f * (quad[0][0] + quad[1][0] + quad[2][0] + quad[3][0]);
-    float cy = 0.25f * (quad[0][1] + quad[1][1] + quad[2][1] + quad[3][1]);
-    for (int i = 0; i < 4; ++i) {
-        const float dx = quad[i][0] - cx;
-        const float dy = quad[i][1] - cy;
-        const float len = sqrtf(dx * dx + dy * dy);
-        if (len > 1e-3f) {
-            quad[i][0] += dx / len * 0.65f;
-            quad[i][1] += dy / len * 0.65f;
+    const int n = contour_n;
+    const bool cached = n >= 8 && n <= kSharedContourPoints;
+    // Every second contour point is enough to locate the four corners, and it
+    // halves the polygon-simplification work on long contours.
+    const bool decimate = cached && n > 256;
+    const int kept = decimate ? (n + 1) / 2 : n;
+    if (cached) {
+        for (int i = threadIdx.x; i < kept; i += blockDim.x) {
+            shared_contour[i] = points[decimate ? i * 2 : i];
         }
     }
-    if (refine_edges) refine_quad(gray, width, height, stride, quad, dim);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bool ok = n >= 8;
+        if (ok) {
+            const float tolerance =
+                fmaxf(1.5f, 0.015f * static_cast<float>(max(x1 - x0, y1 - y0)));
+            float quad[4][2];
+            ok = simplify_to_quad(cached ? shared_contour : points, cached ? kept : n, tolerance,
+                                  quad);
+            if (ok) {
+                // The trace lives on black pixel centres, half a pixel inside
+                // the true edge. Move corners outward before refinement.
+                const float cx = 0.25f * (quad[0][0] + quad[1][0] + quad[2][0] + quad[3][0]);
+                const float cy = 0.25f * (quad[0][1] + quad[1][1] + quad[2][1] + quad[3][1]);
+                for (int i = 0; i < 4; ++i) {
+                    const float dx = quad[i][0] - cx;
+                    const float dy = quad[i][1] - cy;
+                    const float len = sqrtf(dx * dx + dy * dy);
+                    if (len > 1e-3f) {
+                        quad[i][0] += dx / len * 0.65f;
+                        quad[i][1] += dy / len * 0.65f;
+                    }
+                }
+                for (int i = 0; i < 4; ++i) {
+                    traced_quad[i][0] = quad[i][0];
+                    traced_quad[i][1] = quad[i][1];
+                }
+            }
+        }
+        have_quad = ok ? 1 : 0;
+        for (int i = 0; i < 4; ++i) edge_have[i] = 0;
+    }
+    __syncthreads();
+    if (!have_quad) return;
+
+    if (refine_edges && threadIdx.x < 4) {
+        edge_have[threadIdx.x] =
+            fit_edge_line(traced_quad, threadIdx.x, gray, width, height, stride, dim,
+                          edge_lines[threadIdx.x])
+                ? 1
+                : 0;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    float quad[4][2];
+    for (int i = 0; i < 4; ++i) {
+        quad[i][0] = traced_quad[i][0];
+        quad[i][1] = traced_quad[i][1];
+    }
+    if (refine_edges) apply_refined_lines(quad, edge_lines, edge_have);
 
     for (int i = 0; i < 4; ++i) {
         out[i * 2 + 0] = quad[i][0];
@@ -962,66 +1064,31 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ bits,
 // ---------------------------------------------------------------------------
 // 8. Homography sampling and decoding
 // ---------------------------------------------------------------------------
-__device__ bool homography_from_unit_quad(const float quad[4][2], double h[9]) {
-    double a[8][9];
-    const double us[4] = {0.0, 1.0, 1.0, 0.0};
-    const double vs[4] = {0.0, 0.0, 1.0, 1.0};
-    for (int i = 0; i < 4; ++i) {
-        const double u = us[i];
-        const double v = vs[i];
-        const double x = quad[i][0];
-        const double y = quad[i][1];
-        double* r0 = a[2 * i];
-        double* r1 = a[2 * i + 1];
-        r0[0] = u;
-        r0[1] = v;
-        r0[2] = 1.0;
-        r0[3] = 0.0;
-        r0[4] = 0.0;
-        r0[5] = 0.0;
-        r0[6] = -u * x;
-        r0[7] = -v * x;
-        r0[8] = x;
-        r1[0] = 0.0;
-        r1[1] = 0.0;
-        r1[2] = 0.0;
-        r1[3] = u;
-        r1[4] = v;
-        r1[5] = 1.0;
-        r1[6] = -u * y;
-        r1[7] = -v * y;
-        r1[8] = y;
-    }
+// Direct square-to-quad projective mapping.  This is the same homography an
+// 8x8 solve produces, but it needs no eliminated system and stays in single
+// precision, which matters because consumer GPUs run FP64 at 1/32 rate.
+__device__ bool homography_from_unit_quad(const float quad[4][2], float h[9]) {
+    const float x0 = quad[0][0], y0 = quad[0][1];
+    const float x1 = quad[1][0], y1 = quad[1][1];
+    const float x2 = quad[2][0], y2 = quad[2][1];
+    const float x3 = quad[3][0], y3 = quad[3][1];
 
-    for (int col = 0; col < 8; ++col) {
-        int pivot = col;
-        double best = fabs(a[col][col]);
-        for (int row = col + 1; row < 8; ++row) {
-            const double v = fabs(a[row][col]);
-            if (v > best) {
-                best = v;
-                pivot = row;
-            }
-        }
-        if (best < 1e-10) return false;
-        if (pivot != col) {
-            for (int k = col; k < 9; ++k) {
-                const double t = a[col][k];
-                a[col][k] = a[pivot][k];
-                a[pivot][k] = t;
-            }
-        }
-        const double inv = 1.0 / a[col][col];
-        for (int k = col; k < 9; ++k) a[col][k] *= inv;
-        for (int row = 0; row < 8; ++row) {
-            if (row == col) continue;
-            const double f = a[row][col];
-            if (f == 0.0) continue;
-            for (int k = col; k < 9; ++k) a[row][k] -= f * a[col][k];
-        }
-    }
-    for (int i = 0; i < 8; ++i) h[i] = a[i][8];
-    h[8] = 1.0;
+    const float dx1 = x1 - x2, dx2 = x3 - x2, dx3 = x0 - x1 + x2 - x3;
+    const float dy1 = y1 - y2, dy2 = y3 - y2, dy3 = y0 - y1 + y2 - y3;
+    const float det = dx1 * dy2 - dx2 * dy1;
+    if (fabsf(det) < 1e-9f) return false;
+    const float g = (dx3 * dy2 - dx2 * dy3) / det;
+    const float k = (dx1 * dy3 - dx3 * dy1) / det;
+
+    h[0] = x1 - x0 + g * x1;
+    h[1] = x3 - x0 + k * x3;
+    h[2] = x0;
+    h[3] = y1 - y0 + g * y1;
+    h[4] = y3 - y0 + k * y3;
+    h[5] = y0;
+    h[6] = g;
+    h[7] = k;
+    h[8] = 1.0f;
     return true;
 }
 
@@ -1043,7 +1110,8 @@ __device__ int match_code(const uint64_t* codes, int count, uint64_t code, int m
 }
 
 __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stride,
-                            const float base_quad[4][2], int dim,
+                            int image_origin_x, int image_origin_y,
+                            const float base_quad[4][2], int dim, int rotation,
                             const uint64_t* codes, int code_count, int max_hamming,
                             float sharpening, float min_margin, int* out_id, int* out_hamming,
                             float* out_margin, float out_quad[4][2]) {
@@ -1058,7 +1126,8 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
     float diff[kMaxCells];
     float sharp[kMaxCells];
 
-    for (int rot = 0; rot < 4; ++rot) {
+    const int rot = rotation;
+    {
         float corners[4][2];
         for (int k = 0; k < 4; ++k) {
             const int src = (rot + k) & 3;
@@ -1066,22 +1135,24 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
             corners[k][1] = base_quad[src][1];
         }
 
-        double h[9];
-        if (!homography_from_unit_quad(corners, h)) continue;
+        float h[9];
+        if (!homography_from_unit_quad(corners, h)) return false;
 
         bool valid = true;
         for (int cy = 0; cy < dim && valid; ++cy) {
             for (int cx = 0; cx < dim; ++cx) {
-                const double u = (cx + 0.5) / dim;
-                const double v = (cy + 0.5) / dim;
-                const double den = h[6] * u + h[7] * v + 1.0;
-                if (fabs(den) < 1e-9) {
+                const float u = (cx + 0.5f) / static_cast<float>(dim);
+                const float v = (cy + 0.5f) / static_cast<float>(dim);
+                const float den = h[6] * u + h[7] * v + 1.0f;
+                if (fabsf(den) < 1e-9f) {
                     valid = false;
                     break;
                 }
-                const float x = static_cast<float>((h[0] * u + h[1] * v + h[2]) / den);
-                const float y = static_cast<float>((h[3] * u + h[4] * v + h[5]) / den);
-                const float value = sample_bilinear(gray, width, height, stride, x, y);
+                const float x = (h[0] * u + h[1] * v + h[2]) / den;
+                const float y = (h[3] * u + h[4] * v + h[5]) / den;
+                const float value = sample_bilinear(
+                    gray, width, height, stride, x - static_cast<float>(image_origin_x),
+                    y - static_cast<float>(image_origin_y));
                 if (value < 0.0f) {
                     valid = false;
                     break;
@@ -1089,7 +1160,7 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
                 raw[cy * dim + cx] = value;
             }
         }
-        if (!valid) continue;
+        if (!valid) return false;
 
         float mn = 255.0f;
         float mx = 0.0f;
@@ -1097,7 +1168,7 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
             mn = fminf(mn, raw[i]);
             mx = fmaxf(mx, raw[i]);
         }
-        if (mx - mn < 10.0f) continue;
+        if (mx - mn < 10.0f) return false;
         const float thresh = 0.5f * (mn + mx);
 
         bool border_ok = true;
@@ -1111,7 +1182,7 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
                 }
             }
         }
-        if (!border_ok) continue;
+        if (!border_ok) return false;
 
         for (int i = 0; i < dim * dim; ++i) diff[i] = raw[i] - thresh;
         for (int i = 0; i < dim * dim; ++i) sharp[i] = diff[i];
@@ -1148,12 +1219,12 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
 
         int hamming = 0;
         const int id = match_code(codes, code_count, code, max_hamming, &hamming);
-        if (id < 0) continue;
+        if (id < 0) return false;
 
         const float white_avg = white_sum / static_cast<float>(max(white_count, 1));
         const float black_avg = black_sum / static_cast<float>(max(black_count, 1));
         const float margin = fminf(white_avg, black_avg);
-        if (margin < min_margin) continue;
+        if (margin < min_margin) return false;
 
         const float score = static_cast<float>(4 - hamming) * 1000.0f + margin;
         if (score > best_score) {
@@ -1185,7 +1256,7 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
                                const uint64_t* __restrict__ codes, int code_count,
                                int max_hamming, float sharpening, float min_margin,
                                bd_detection* __restrict__ detections, int max_detections) {
-    const int ci = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ci = blockIdx.x;
     if (ci >= max_candidates) return;
     if (ci >= static_cast<int>(counts[0])) return;
 
@@ -1198,24 +1269,64 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
         quad[i][1] = q[i * 2 + 1];
     }
 
-    int id = 0;
-    int hamming = 0;
-    float margin = 0.0f;
-    float corners[4][2];
-    if (!decode_quad(gray, width, height, stride, quad, dim, codes, code_count,
-                     max_hamming, sharpening, min_margin, &id, &hamming, &margin, corners)) {
-        return;
+    // The four rotations are independent: one thread decodes each, then the
+    // block picks the same winner the serial loop used to (highest score,
+    // first rotation on ties).
+    struct RotationResult {
+        int id;
+        int hamming;
+        float margin;
+        float corners[4][2];
+    };
+    __shared__ RotationResult results[4];
+    if (threadIdx.x < 4) {
+        results[threadIdx.x].id = -1;
     }
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        int id = 0;
+        int hamming = 0;
+        float margin = 0.0f;
+        float corners[4][2];
+        if (decode_quad(gray, width, height, stride, 0, 0, quad, dim, threadIdx.x, codes,
+                        code_count, max_hamming, sharpening, min_margin, &id, &hamming,
+                        &margin, corners)) {
+            RotationResult& result = results[threadIdx.x];
+            result.id = id;
+            result.hamming = hamming;
+            result.margin = margin;
+            for (int k = 0; k < 4; ++k) {
+                result.corners[k][0] = corners[k][0];
+                result.corners[k][1] = corners[k][1];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    int best = -1;
+    float best_score = -1.0f;
+    for (int r = 0; r < 4; ++r) {
+        if (results[r].id < 0) continue;
+        const float score = static_cast<float>(4 - results[r].hamming) * 1000.0f +
+                            results[r].margin;
+        if (score > best_score) {
+            best_score = score;
+            best = r;
+        }
+    }
+    if (best < 0) return;
 
     const uint32_t slot = atomicAdd(&counts[1], 1u);
     if (slot >= static_cast<uint32_t>(max_detections)) return;
     bd_detection d;
-    d.id = id;
-    d.hamming = hamming;
-    d.decision_margin = margin;
+    d.id = results[best].id;
+    d.hamming = results[best].hamming;
+    d.decision_margin = results[best].margin;
     for (int k = 0; k < 4; ++k) {
-        d.corners[k * 2 + 0] = corners[k][0];
-        d.corners[k * 2 + 1] = corners[k][1];
+        d.corners[k * 2 + 0] = results[best].corners[k][0];
+        d.corners[k * 2 + 1] = results[best].corners[k][1];
     }
     d.reserved = 0;
     detections[slot] = d;
@@ -1289,50 +1400,87 @@ __global__ void k_finalize(bd_detection* __restrict__ detections, uint32_t* __re
 // Launch
 // ---------------------------------------------------------------------------
 void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
-    cudaMemsetAsync(a.counts, 0, 5 * sizeof(uint32_t), stream);
+    // BD_PROFILE_TEMP: per-stage GPU timings, only for local optimization work.
+    const bool profile = std::getenv("BD_PROFILE") != nullptr;
+    cudaEvent_t p0 = nullptr;
+    cudaEvent_t p1 = nullptr;
+    if (profile) {
+        cudaEventCreate(&p0);
+        cudaEventCreate(&p1);
+    }
+#define BD_STAGE(label, ...)                                         \
+    do {                                                             \
+        if (profile) cudaEventRecord(p0, stream);                    \
+        __VA_ARGS__;                                                 \
+        if (profile) {                                               \
+            cudaEventRecord(p1, stream);                             \
+            cudaEventSynchronize(p1);                                \
+            float ms = 0.0f;                                         \
+            cudaEventElapsedTime(&ms, p0, p1);                       \
+            std::printf("  %-16s %.3f ms\n", label, ms);             \
+        }                                                            \
+    } while (0)
+
+    BD_STAGE("memset", cudaMemsetAsync(a.counts, 0, 5 * sizeof(uint32_t), stream));
 
     const int tile_count = a.tile_w * a.tile_h;
     const int tile_threads = 128;
-    k_tile_threshold<<<(tile_count + tile_threads - 1) / tile_threads, tile_threads, 0,
-                       stream>>>(a.gray, a.width, a.height, a.stride, a.tile_thresh,
-                                 a.tile_active, a.tile_w, a.tile_h);
-    k_build_row_roi<<<1, 256, 0, stream>>>(a.tile_active, a.tile_w, a.tile_h, a.row_active,
-                                           a.row_start, a.row_end, a.counts);
+    BD_STAGE("tile_threshold",
+             k_tile_threshold<<<(tile_count + tile_threads - 1) / tile_threads, tile_threads,
+                                0, stream>>>(a.gray, a.width, a.height, a.stride,
+                                             a.tile_thresh, a.tile_active, a.tile_w,
+                                             a.tile_h));
+    BD_STAGE("row_roi", k_build_row_roi<<<1, 256, 0, stream>>>(
+                            a.tile_active, a.tile_w, a.tile_h, a.row_active, a.row_start,
+                            a.row_end, a.counts));
 
     const dim3 bin_grid((a.words + 7) / 8, a.height);
-    k_binarize<<<bin_grid, 256, 0, stream>>>(a.gray, a.width, a.height, a.stride,
-                                             a.tile_thresh, a.row_active, a.row_start,
-                                             a.row_end, a.tile_w, a.bits, a.words);
+    BD_STAGE("binarize", k_binarize<<<bin_grid, 256, 0, stream>>>(
+                             a.gray, a.width, a.height, a.stride, a.tile_thresh,
+                             a.row_active, a.row_start, a.row_end, a.tile_w, a.bits,
+                             a.words));
 
     const size_t smem = static_cast<size_t>(a.words) * 2 * sizeof(uint32_t);
-    k_find_runs<<<a.height, kFindRunsThreads, smem, stream>>>(
-        a.bits, a.width, a.words, a.row_cap, a.row_count, a.runs, a.parent, a.area, a.bbox,
-        a.counts, a.row_active);
+    BD_STAGE("find_runs", k_find_runs<<<a.height, kFindRunsThreads, smem, stream>>>(
+                              a.bits, a.width, a.words, a.row_cap, a.row_count, a.runs,
+                              a.parent, a.area, a.bbox, a.counts, a.row_active));
 
-    k_merge_runs<<<(a.height + kMergeWarps - 1) / kMergeWarps, kMergeThreads, 0, stream>>>(
-        a.runs, a.row_count, a.parent, a.row_cap, a.height, a.row_active);
+    BD_STAGE("merge_runs", k_merge_runs<<<(a.height + kMergeWarps - 1) / kMergeWarps,
+                                          kMergeThreads, 0, stream>>>(
+                               a.runs, a.row_count, a.parent, a.row_cap, a.height,
+                               a.row_active));
 
     const int row_grid = (a.height + kMergeWarps - 1) / kMergeWarps;
-    k_region_stats<<<row_grid, kMergeThreads, 0, stream>>>(
-        a.runs, a.row_count, a.parent, a.area, a.bbox, a.row_cap, a.height, a.row_active);
+    BD_STAGE("region_stats", k_region_stats<<<row_grid, kMergeThreads, 0, stream>>>(
+                                 a.runs, a.row_count, a.parent, a.area, a.bbox, a.row_cap,
+                                 a.height, a.row_active));
 
-    k_collect_candidates<<<row_grid, kMergeThreads, 0, stream>>>(
-        a.row_count, a.parent, a.area, a.bbox, a.row_cap, a.height, a.width,
-        a.min_cluster_pixels, a.min_tag_pixels, a.max_candidates, a.candidates, a.counts,
-        a.row_active);
+    BD_STAGE("collect", k_collect_candidates<<<row_grid, kMergeThreads, 0, stream>>>(
+                            a.row_count, a.parent, a.area, a.bbox, a.row_cap, a.height,
+                            a.width, a.min_cluster_pixels, a.min_tag_pixels,
+                            a.max_candidates, a.candidates, a.counts, a.row_active));
 
-    k_fit_quads<<<(a.max_candidates + 127) / 128, 128, 0, stream>>>(
-        a.bits, a.runs, a.row_count, a.parent, a.bbox, a.candidates, a.counts,
-        a.gray, a.width, a.height, a.stride, a.words, a.row_cap, a.max_candidates,
-        a.contour_cap, a.dim, a.refine_edges, a.contour, a.quads);
+    BD_STAGE("fit_quads", k_fit_quads<<<a.max_candidates, 32, 0, stream>>>(
+                              a.bits, a.runs, a.row_count, a.parent, a.bbox, a.candidates,
+                              a.counts, a.gray, a.width, a.height, a.stride, a.words,
+                              a.row_cap, a.max_candidates, a.contour_cap, a.dim,
+                              a.refine_edges, a.contour, a.quads));
 
-    k_decode_quads<<<(a.max_candidates + 127) / 128, 128, 0, stream>>>(
-        a.gray, a.width, a.height, a.stride, a.quads, a.counts, a.max_candidates, a.dim,
-        a.codes, a.code_count, a.max_hamming, a.sharpening, a.min_decision_margin,
-        a.detections, a.max_detections);
+    BD_STAGE("decode", k_decode_quads<<<a.max_candidates, 32, 0, stream>>>(
+                           a.gray, a.width, a.height, a.stride, a.quads, a.counts,
+                           a.max_candidates, a.dim, a.codes, a.code_count, a.max_hamming,
+                           a.sharpening, a.min_decision_margin, a.detections,
+                           a.max_detections));
 
     const size_t final_smem = static_cast<size_t>(a.max_detections) * sizeof(bd_detection);
-    k_finalize<<<1, 1, final_smem, stream>>>(a.detections, a.counts, a.max_detections);
+    BD_STAGE("finalize", k_finalize<<<1, 1, final_smem, stream>>>(a.detections, a.counts,
+                                                                  a.max_detections));
+
+    if (profile) {
+        cudaEventDestroy(p0);
+        cudaEventDestroy(p1);
+    }
+#undef BD_STAGE
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# Optional dependencies for compare_detectors.py, not needed to build the
+# detector.  Install into a throw-away environment, for example:
+#
+#   python -m venv --system-site-packages .venv
+#   .venv/Scripts/python -m pip install -r detector/bench/requirements.txt
+#
+# The comparison backends are imported lazily; omit any line to drop its row.
+numpy>=1.24
+opencv-python>=4.7      # ArUco (DICT_APRILTAG_36h11) and scene loading
+pupil-apriltags>=1.0.4  # bundles the upstream AprilTag 3 C library
+napa-vision>=0.5.1      # NAPA; GPL-3.0, benchmark use only, not linked into bdcudatag

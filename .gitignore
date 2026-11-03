@@ -10,8 +10,15 @@ java-api/bin
 
 # Local benchmark dumps
 *.pgm
+detector/bench/scenes/
+detector/bench/.venv/
+detector/bench/__pycache__/
+detector/bench/harness.log
+detector/bench/results.md
+detector/bench/results.json
 
 # Camera viewer
 viewer/.gradle
 viewer/build
+viewer/bin
 snapshot-*.png

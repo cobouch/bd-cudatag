@@ -52,7 +52,9 @@ architecture is SM 8.7 (Jetson Orin Nano Super).
 cmake -S detector -B detector/build -DCMAKE_BUILD_TYPE=Release
 cmake --build detector/build -j
 ./detector/build/bdcudatag_tests
-./detector/build/bdcudatag_bench 1280 720 600
+./detector/build/bdcudatag_bench 1280 800 600
+./detector/build/bdcudatag_bench --markdown   # resolution sweep, accuracy + latency
+./detector/build/bdcudatag_scenes detector/bench/scenes 32   # scenes for the comparison harness
 ```
 
 On Windows with Visual Studio 2022:
@@ -79,23 +81,101 @@ sudo jetson_clocks
 when comparing driver overhead. `-DCMAKE_CUDA_ARCHITECTURES=86` targets desktop
 Ampere for local testing; use `87` for the Orin Nano.
 
-## Results
+## Benchmarks
 
-Measured locally on an RTX 3060 (SM 8.6, desktop Linux/Windows driver, 1980 MHz
-SM clock), 8 synthetic tags at 1280x720:
+The benchmark compares bdcudatag with NAPA, OpenCV's ArUco and the original
+AprilTag 3 library on identical frames. `detector/bench` renders deterministic
+synthetic scenes from the family tables, so ground truth is exact and no camera
+is needed: 32 scenes per resolution, eight `tag36h11` tags at known poses, and
+on a quarter of the scenes two tag-shaped decoys filled with random data that
+must not decode. Images use 2x2 supersampling plus deterministic noise of up to
+3 DN.
 
-| Image     | Tags | Throughput | Latency p50 | ROI rows  |
-| --------- | ---- | ---------- | ----------- | --------- |
-| 640x480   | 5    | ~360 FPS   | 2.7 ms      | -         |
-| 1280x720  | 8    | ~380 FPS   | 2.55 ms     | 552 / 720 |
-| 1920x1080 | 8    | ~395 FPS   | 2.50 ms     | -         |
+Every detector runs single-threaded in one process, after 20 warm-up frames,
+cycling through the scenes. Metrics:
 
-The 720p and 1080p numbers are nearly identical because the synchronous `detect`
-call on Windows/WDDM has a fixed submission/synchronization floor of roughly 2.5
-ms; the marginal GPU work for 1080p is small. On Jetson (Linux, Tegra driver)
-this floor is much lower, so measure on-device before quoting FPS. The ROI still
-pays off: only the rows containing contrasting content are searched, and a blank
-frame has zero candidates.
+- **Median / p95**: wall clock around one `detect` call, in milliseconds.
+- **Tags found**: ground-truth tags matched to a detection with the same id and
+  a centre within 0.75 tag sides, as a percentage.
+- **Corner error**: median over matched tags of the mean distance between the
+  four detected corners and ground truth, in pixels. Corners are matched as an
+  unordered set because libraries disagree on the starting corner and winding.
+- **Wrong IDs**: detections whose id belongs to no tag in the scene, including
+  the decoys.
+
+Measured on Windows 11 with an AMD Ryzen 9 7900X and an RTX 3060 (driver 610.88,
+CUDA 12.9). All scenes use `tag36h11`. Configurations: bdcudatag with defaults
+and the CUDA graph enabled; NAPA 0.5.1 with its defaults, plus `min_tag_px=16`
+as a second row; ArUco from OpenCV 4.12.0 with `DICT_APRILTAG_36h11` and
+`CORNER_REFINE_SUBPIX`; AprilTag 3 through pupil-apriltags 1.0.4.post11 at full
+resolution (`quad_decimate=1.0`, `refine_edges=1`, one thread).
+
+| Resolution | Detector | Median (ms) | p95 (ms) | Tags found | Corner error (px) | Wrong IDs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 640x480 | bdcudatag | 0.50 | 0.56 | 99.6% | 0.24 | 0 |
+| 640x480 | NAPA | 0.28 | 0.38 | 99.6% | 0.10 | 0 |
+| 640x480 | NAPA (min_tag_px=16) | 0.55 | 0.65 | 100.0% | 0.10 | 0 |
+| 640x480 | ArUco (subpixel) | 1.15 | 1.41 | 99.6% | 0.30 | 0 |
+| 640x480 | AprilTag 3 (full res) | 2.11 | 2.34 | 100.0% | 0.71 | 0 |
+| 1280x720 | bdcudatag | 0.70 | 0.94 | 100.0% | 0.26 | 0 |
+| 1280x720 | NAPA | 0.47 | 0.52 | 100.0% | 0.15 | 0 |
+| 1280x720 | NAPA (min_tag_px=16) | 1.34 | 1.48 | 100.0% | 0.15 | 0 |
+| 1280x720 | ArUco (subpixel) | 2.34 | 3.03 | 100.0% | 0.29 | 0 |
+| 1280x720 | AprilTag 3 (full res) | 5.71 | 8.11 | 100.0% | 0.71 | 0 |
+| 1280x800 | bdcudatag | 0.83 | 4.13 | 99.6% | 0.25 | 0 |
+| 1280x800 | NAPA | 0.50 | 0.70 | 100.0% | 0.16 | 0 |
+| 1280x800 | NAPA (min_tag_px=16) | 2.35 | 2.49 | 100.0% | 0.16 | 0 |
+| 1280x800 | ArUco (subpixel) | 2.94 | 3.58 | 100.0% | 0.30 | 0 |
+| 1280x800 | AprilTag 3 (full res) | 7.29 | 9.54 | 100.0% | 0.72 | 0 |
+| 1920x1080 | bdcudatag | 1.14 | 7.52 | 99.2% | 0.32 | 0 |
+| 1920x1080 | NAPA | 0.79 | 1.11 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA (min_tag_px=16) | 2.56 | 3.54 | 100.0% | 0.23 | 0 |
+| 1920x1080 | ArUco (subpixel) | 5.12 | 5.92 | 100.0% | 0.33 | 0 |
+| 1920x1080 | AprilTag 3 (full res) | 11.91 | 15.29 | 100.0% | 0.72 | 0 |
+
+NAPA is still the fastest and most corner-accurate detector here: bdcudatag is
+about 1.7x slower at 1280x800 (0.83 vs 0.50 ms) and 1.4x slower at 1920x1080
+(1.14 vs 0.79 ms). bdcudatag is now 3.5x faster than ArUco at 1280x800 and 4.5x
+faster at 1920x1080, and 4-10x faster than full-resolution AprilTag. Its corner
+error (0.24-0.32 px) is slightly better than ArUco's and behind NAPA's. No
+detector decoded a decoy, so the wrong-id column is zero throughout;
+bdcudatag's lower recall is one missed tag out of 256 at 1280x800 and two at
+1920x1080. The p95 numbers for bdcudatag in this table include occasional
+host-side stalls in the Python harness; the native benchmark, which times only
+`detect`, reports p95 of 0.77 ms at 1280x800 and 1.10 ms at 1920x1080.
+
+`detect` is synchronous and includes host-to-device staging and a device
+synchronization, so these are end-to-end frame times rather than kernel times.
+On Windows/WDDM part of each frame is driver submission overhead that does not
+scale with resolution; on a Jetson (Linux/Tegra) the same call is cheaper, so
+measure on-device before quoting FPS. The native benchmark also prints GPU time
+and ROI rows for bdcudatag at each resolution.
+
+### Reproducing
+
+The native benchmark needs only the CUDA build:
+
+```bash
+cmake -S detector -B detector/build -DCMAKE_BUILD_TYPE=Release
+cmake --build detector/build -j --target bdcudatag_bench bdcudatag_scenes
+./detector/build/bdcudatag_bench --frames 200 --scenes 32 --markdown
+```
+
+The comparison harness runs all four detectors in one process. It needs a built
+`bdcudatag` library plus optional Python packages; missing ones are skipped by
+name, so the table can be regenerated one detector at a time:
+
+```bash
+./detector/build/bdcudatag_scenes detector/bench/scenes 32   # no GPU required
+cd detector/bench
+python -m venv --system-site-packages .venv
+.venv/Scripts/python -m pip install -r requirements.txt      # .venv/bin/python on Linux
+.venv/Scripts/python compare_detectors.py --scenes scenes --frames 200 \
+    --markdown results.md
+```
+
+NAPA is GPL-3.0. It is imported only by the benchmark script for comparison;
+the detector and the rest of the repository do not link against it.
 
 ## Java API
 
@@ -262,7 +342,8 @@ detector/
   include/bdcudatag/   C and C++ public headers
   src/                 CUDA pipeline, host API, generated family tables
   tests/               synthetic end-to-end tests (no camera required)
-  bench/               synthetic throughput benchmark
+  bench/               synthetic accuracy/latency benchmark, scene exporter and
+                       cross-detector comparison harness
 java-api/              Java FFM wrapper (JPMS module) and JUnit tests
 viewer/                Swing camera test app (separate Gradle build)
 ```
