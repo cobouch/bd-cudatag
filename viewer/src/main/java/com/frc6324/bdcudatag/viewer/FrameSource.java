@@ -2,6 +2,7 @@ package com.frc6324.bdcudatag.viewer;
 
 import java.io.IOException;
 import java.util.Locale;
+
 import org.opencv.core.Mat;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.videoio.VideoCapture;
@@ -53,6 +54,10 @@ final class FrameSource implements AutoCloseable {
         }
         capture.set(Videoio.CAP_PROP_FRAME_WIDTH, options.width());
         capture.set(Videoio.CAP_PROP_FRAME_HEIGHT, options.height());
+
+        capture.set(Videoio.CAP_PROP_AUTO_EXPOSURE, 1.0);
+        capture.set(Videoio.CAP_PROP_AUTO_WB, 1.0);
+        
         String description =
                 String.format(
                         Locale.ROOT,

@@ -71,6 +71,12 @@ struct PipelineArgs {
     float sharpening = 0.0f;
     uint8_t* tile_thresh = nullptr;
     uint8_t* tile_active = nullptr;
+    uint8_t* tile_min = nullptr;
+    uint8_t* tile_max = nullptr;
+    uint8_t* tile_mean = nullptr;
+    uint32_t* span_hist = nullptr;
+    uint32_t* mean_hist = nullptr;
+    uint32_t* tile_ref = nullptr;
     uint8_t* row_active = nullptr;
     int* row_start = nullptr;
     int* row_end = nullptr;
@@ -90,12 +96,13 @@ struct PipelineArgs {
 // ---------------------------------------------------------------------------
 // 1. Tile threshold
 // ---------------------------------------------------------------------------
-__global__ void k_tile_threshold(const uint8_t* __restrict__ gray, int width, int height,
-                                 int stride, uint8_t* __restrict__ thresh,
-                                 uint8_t* __restrict__ active, int tile_w, int tile_h) {
+// Per-tile intensity extremes.
+__global__ void k_tile_stats(const uint8_t* __restrict__ gray, int width, int height,
+                             int stride, uint8_t* __restrict__ tile_min,
+                             uint8_t* __restrict__ tile_max, uint8_t* __restrict__ tile_mean,
+                             int tile_w, int tile_h) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int tile_count = tile_w * tile_h;
-    if (idx >= tile_count) return;
+    if (idx >= tile_w * tile_h) return;
 
     const int tx = idx % tile_w;
     const int ty = idx / tile_w;
@@ -106,22 +113,162 @@ __global__ void k_tile_threshold(const uint8_t* __restrict__ gray, int width, in
 
     int mn = 255;
     int mx = 0;
+    int sum = 0;
+    int count = 0;
     for (int y = y0; y < y1; ++y) {
         const uint8_t* row = gray + y * stride;
         for (int x = x0; x < x1; ++x) {
             const int v = row[x];
             mn = min(mn, v);
             mx = max(mx, v);
+            sum += v;
+            ++count;
+        }
+    }
+    tile_min[idx] = static_cast<uint8_t>(mn);
+    tile_max[idx] = static_cast<uint8_t>(mx);
+    tile_mean[idx] = static_cast<uint8_t>(count > 0 ? (sum + count / 2) / count : 0);
+}
+
+// Histogram of per-tile intensity spans.  On a noisy or dark frame the spans
+// are dominated by sensor noise, so their lower quartile is a direct measure
+// of the noise floor the threshold has to clear.
+__global__ void k_tile_histograms(const uint8_t* __restrict__ tile_min,
+                                  const uint8_t* __restrict__ tile_max,
+                                  const uint8_t* __restrict__ tile_mean, int tile_w, int tile_h,
+                                  uint32_t* __restrict__ span_hist,
+                                  uint32_t* __restrict__ mean_hist) {
+    __shared__ uint32_t local_span[256];
+    __shared__ uint32_t local_mean[64];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) local_span[i] = 0;
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) local_mean[i] = 0;
+    __syncthreads();
+
+    const int total = tile_w * tile_h;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += blockDim.x * gridDim.x) {
+        const int span = static_cast<int>(tile_max[i]) - static_cast<int>(tile_min[i]);
+        atomicAdd(&local_span[span & 0xff], 1u);
+        atomicAdd(&local_mean[tile_mean[i] >> 2], 1u);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        if (local_span[i]) atomicAdd(&span_hist[i], local_span[i]);
+    }
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) {
+        if (local_mean[i]) atomicAdd(&mean_hist[i], local_mean[i]);
+    }
+}
+
+// Frame references: [0] lower quartile of the tile spans (the noise floor),
+// [1] Otsu threshold of the tile means (the black/white split for tiles that
+// have no contrast of their own).
+//
+// The histograms are staged in shared memory first: reading 512 bins serially
+// from global memory costs more than the whole rest of the pipeline.
+__global__ void k_tile_reference(const uint32_t* __restrict__ span_hist,
+                                 const uint32_t* __restrict__ mean_hist,
+                                 uint32_t* __restrict__ out) {
+    __shared__ uint32_t spans[256];
+    __shared__ uint32_t means[64];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) spans[i] = span_hist[i];
+    for (int i = threadIdx.x; i < 64; i += blockDim.x) means[i] = mean_hist[i];
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    uint32_t span_total = 0;
+    for (int i = 0; i < 256; ++i) span_total += spans[i];
+    uint32_t span = 0;
+    if (span_total > 0) {
+        const uint32_t target = span_total / 4;
+        uint32_t seen = 0;
+        for (int i = 0; i < 256; ++i) {
+            seen += spans[i];
+            if (seen > target) {
+                span = static_cast<uint32_t>(i);
+                break;
+            }
+        }
+    }
+    out[0] = span;
+
+    constexpr int kBins = 64;
+    float total = 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < kBins; ++i) {
+        total += static_cast<float>(means[i]);
+        sum += static_cast<float>(i) * static_cast<float>(means[i]);
+    }
+    int otsu = 0;
+    if (total > 0.0f) {
+        float weight_below = 0.0f;
+        float sum_below = 0.0f;
+        float best = -1.0f;
+        for (int i = 0; i < kBins; ++i) {
+            weight_below += static_cast<float>(means[i]);
+            if (weight_below <= 0.0f) continue;
+            const float weight_above = total - weight_below;
+            if (weight_above <= 0.0f) break;
+            sum_below += static_cast<float>(i) * static_cast<float>(means[i]);
+            const float mean_below = sum_below / weight_below;
+            const float mean_above = (sum - sum_below) / weight_above;
+            const float delta = mean_below - mean_above;
+            const float between = weight_below * weight_above * delta * delta;
+            if (between > best) {
+                best = between;
+                otsu = i;
+            }
+        }
+    }
+    // Bin centres of the 4-DN buckets, so the split sits on the real level.
+    out[1] = static_cast<uint32_t>(otsu * 4 + 2);
+}
+
+// Threshold per tile, pooled over a 3x3 tile window.  The window is what makes
+// a dim frame work: a tile of flat background has no contrast of its own, so
+// judging it alone classifies the whole background black, which then merges
+// with each tag's black border.  Pooling gives it the contrast of the nearby
+// border and its quiet zone, so the background stays white.
+__global__ void k_tile_threshold(const uint8_t* __restrict__ tile_min,
+                                 const uint8_t* __restrict__ tile_max,
+                                 const uint32_t* __restrict__ tile_ref, int tile_w, int tile_h,
+                                 uint8_t* __restrict__ thresh,
+                                 uint8_t* __restrict__ active) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= tile_w * tile_h) return;
+
+    const int tx = idx % tile_w;
+    const int ty = idx / tile_w;
+    int mn = 255;
+    int mx = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        const int y = ty + dy;
+        if (y < 0 || y >= tile_h) continue;
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int x = tx + dx;
+            if (x < 0 || x >= tile_w) continue;
+            mn = min(mn, static_cast<int>(tile_min[y * tile_w + x]));
+            mx = max(mx, static_cast<int>(tile_max[y * tile_w + x]));
         }
     }
 
-    // Flat tiles fall back to a global threshold. Using the local midpoint
-    // there would classify a uniform white tile as black (or vice versa)
-    // depending on rounding, which breaks the tag border.
-    int t = 127;
-    if (mx - mn >= kMinTileContrast) t = (mn + mx + 1) >> 1;
+    // A tile with real contrast uses its own midpoint, but only when it also
+    // clears the frame's noise floor, otherwise noise around the local mean
+    // turns into speckle runs that cost more than the tags do.
+    // A flat tile has no local evidence either way, so it falls back to the
+    // frame's Otsu split.  White would be wrong inside a thick black border
+    // (it splits the border ring and the fill test then rejects it); black
+    // would swallow a dim background into the border.
+    const int floor_contrast = max(kMinTileContrast, static_cast<int>((tile_ref[0] * 3) / 2));
+    int t = static_cast<int>(tile_ref[1]);
+    if (mx - mn >= floor_contrast) t = (mn + mx + 1) >> 1;
     thresh[idx] = static_cast<uint8_t>(t);
-    active[idx] = (mx - mn >= kMinTileContrast) ? 1u : 0u;
+    // The search band only needs rows that contain a real edge; a tile that is
+    // merely next to one must not widen the band (that costs runs on every
+    // noisy or textured frame).
+    const int own = static_cast<int>(tile_max[idx]) - static_cast<int>(tile_min[idx]);
+    active[idx] = own >= kMinTileContrast ? 1u : 0u;
 }
 
 // Coarse ROI: a tile row with any contrast is searched only between the
@@ -163,31 +310,44 @@ __global__ void k_build_row_roi(const uint8_t* __restrict__ active, int tile_w, 
     // Everything between the first and last contrasting tile row is searched.
     // Closing the vertical gaps keeps a tag whole even when a tile row inside
     // its black border happens to be flat (for example a tile-aligned edge).
-    for (int ty = threadIdx.x; ty < tile_h; ty += blockDim.x) {
+    // One warp per tile row: scanning tile_w tiles serially per row is the
+    // most expensive part of this kernel at 1080p.
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+    for (int ty = warp; ty < tile_h; ty += warps) {
         if (s_bottom < 0 || ty < s_top - 1 || ty > s_bottom + 1) {
-            row_active[ty] = 0;
-            row_start[ty] = 0;
-            row_end[ty] = -1;
+            if (lane == 0) {
+                row_active[ty] = 0;
+                row_start[ty] = 0;
+                row_end[ty] = -1;
+            }
             continue;
         }
-        row_active[ty] = 1;
-        atomicAdd(&counts[4], 1u);
 
         const uint8_t* row = active + ty * tile_w;
         int mn = tile_w;
         int mx = -1;
-        for (int x = 0; x < tile_w; ++x) {
+        for (int x = lane; x < tile_w; x += 32) {
             if (row[x]) {
                 mn = min(mn, x);
                 mx = max(mx, x);
             }
         }
-        if (mx < 0) {
-            row_start[ty] = 0;
-            row_end[ty] = tile_w - 1;
-        } else {
-            row_start[ty] = max(0, mn - 4);
-            row_end[ty] = min(tile_w - 1, mx + 4);
+        for (int off = 16; off > 0; off >>= 1) {
+            mn = min(mn, __shfl_down_sync(0xffffffffu, mn, off));
+            mx = max(mx, __shfl_down_sync(0xffffffffu, mx, off));
+        }
+        if (lane == 0) {
+            row_active[ty] = 1;
+            atomicAdd(&counts[4], 1u);
+            if (mx < 0) {
+                row_start[ty] = 0;
+                row_end[ty] = tile_w - 1;
+            } else {
+                row_start[ty] = max(0, mn - 4);
+                row_end[ty] = min(tile_w - 1, mx + 4);
+            }
         }
     }
 }
@@ -794,12 +954,13 @@ __device__ bool fit_edge_line_warp(const float quad[4][2], int edge, const uint8
 }
 
 // Intersects the fitted edge lines and keeps the result when every corner
-// stays close to the traced quad and the quad remains convex.
-__device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
-                                    const int have[4]) {
+// stays close to the traced quad and the quad remains convex.  Returns the
+// largest corner move it applied, so the caller can stop once it converges.
+__device__ float apply_refined_lines(float quad[4][2], const float lines[4][4],
+                                     const int have[4]) {
     int line_count = 0;
     for (int i = 0; i < 4; ++i) line_count += have[i] ? 1 : 0;
-    if (line_count < 3) return;
+    if (line_count < 3) return 0.0f;
 
     float refined[4][2];
     for (int i = 0; i < 4; ++i) {
@@ -817,6 +978,7 @@ __device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
     // inner edge still fails the border/hamming checks downstream.
     const float max_shift = fminf(fmaxf(0.15f * extent, 4.0f), 16.0f);
 
+    float moved = 0.0f;
     for (int i = 0; i < 4; ++i) {
         const int j = (i + 1) & 3;
         if (!have[i] || !have[j]) continue;
@@ -828,13 +990,14 @@ __device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
         if (dx * dx + dy * dy > max_shift * max_shift) continue;
         refined[corner][0] = x;
         refined[corner][1] = y;
+        moved = fmaxf(moved, sqrtf(dx * dx + dy * dy));
     }
 
     // Reject refinements that produce a non-convex or degenerate quad.
     for (int i = 0; i < 4; ++i) {
         const int j = (i + 1) & 3;
         if (hypotf(refined[j][0] - refined[i][0], refined[j][1] - refined[i][1]) < 3.0f) {
-            return;
+            return 0.0f;
         }
     }
     float area2 = 0.0f;
@@ -842,11 +1005,12 @@ __device__ void apply_refined_lines(float quad[4][2], const float lines[4][4],
         const int j = (i + 1) & 3;
         area2 += refined[i][0] * refined[j][1] - refined[j][0] * refined[i][1];
     }
-    if (area2 <= 0.0f) return;
+    if (area2 <= 0.0f) return 0.0f;
     for (int i = 0; i < 4; ++i) {
         quad[i][0] = refined[i][0];
         quad[i][1] = refined[i][1];
     }
+    return moved;
 }
 
 // One block per candidate.  The block collects the component's row extremes,
@@ -869,6 +1033,7 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ runs,
     __shared__ float edge_lines[4][4];
     __shared__ int edge_have[4];
     __shared__ int quad_ok;
+    __shared__ float refine_moved;
     __shared__ uint32_t hull[kFitDirections];
 
     const int ci = blockIdx.x;
@@ -983,13 +1148,16 @@ __global__ void k_fit_quads(const uint32_t* __restrict__ runs,
                     quad[i][0] = fit_quad[i][0];
                     quad[i][1] = fit_quad[i][1];
                 }
-                apply_refined_lines(quad, edge_lines, edge_have);
+                refine_moved = apply_refined_lines(quad, edge_lines, edge_have);
                 for (int i = 0; i < 4; ++i) {
                     fit_quad[i][0] = quad[i][0];
                     fit_quad[i][1] = quad[i][1];
                 }
             }
             __syncthreads();
+            // A quad whose corners barely moved is converged; the second pass
+            // would only re-sample the same lines.
+            if (refine_moved < 0.15f) break;
         }
     }
 
@@ -1190,13 +1358,21 @@ __device__ bool decode_quad(const uint8_t* gray, int width, int height, int stri
     return true;
 }
 
+// One warp per candidate, several candidates per block.  A block per candidate
+// meant the grid was padded to max_candidates even when a frame had a handful
+// of them, and that launch cost dominated the decode stage.
+constexpr int kDecodeWarps = 8;
+constexpr int kDecodeThreads = kDecodeWarps * 32;
+
 __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int height,
                                int stride, const float* __restrict__ quads,
                                uint32_t* __restrict__ counts, int max_candidates, int dim,
                                const uint64_t* __restrict__ codes, int code_count,
                                int max_hamming, float sharpening, float min_margin,
                                bd_detection* __restrict__ detections, int max_detections) {
-    const int ci = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int ci = blockIdx.x * kDecodeWarps + warp;
     if (ci >= max_candidates) return;
     if (ci >= static_cast<int>(counts[0])) return;
 
@@ -1209,30 +1385,27 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
         quad[i][1] = q[i * 2 + 1];
     }
 
-    // The four rotations are independent: one thread decodes each, then the
-    // block picks the same winner the serial loop used to (highest score,
-    // first rotation on ties).
+    // The four rotations are independent: one lane decodes each, then the warp
+    // picks the same winner the serial loop used to (highest score, first
+    // rotation on ties).
     struct RotationResult {
         int id;
         int hamming;
         float margin;
         float corners[4][2];
     };
-    __shared__ RotationResult results[4];
-    if (threadIdx.x < 4) {
-        results[threadIdx.x].id = -1;
-    }
-    __syncthreads();
+    __shared__ RotationResult results[kDecodeWarps][4];
 
-    if (threadIdx.x < 4) {
+    if (lane < 4) {
+        RotationResult& result = results[warp][lane];
+        result.id = -1;
         int id = 0;
         int hamming = 0;
         float margin = 0.0f;
         float corners[4][2];
-        if (decode_quad(gray, width, height, stride, 0, 0, quad, dim, threadIdx.x, codes,
-                        code_count, max_hamming, sharpening, min_margin, &id, &hamming,
-                        &margin, corners)) {
-            RotationResult& result = results[threadIdx.x];
+        if (decode_quad(gray, width, height, stride, 0, 0, quad, dim, lane, codes, code_count,
+                        max_hamming, sharpening, min_margin, &id, &hamming, &margin,
+                        corners)) {
             result.id = id;
             result.hamming = hamming;
             result.margin = margin;
@@ -1242,15 +1415,16 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
             }
         }
     }
-    __syncthreads();
-    if (threadIdx.x != 0) return;
+    __syncwarp();
+
+    if (lane != 0) return;
 
     int best = -1;
     float best_score = -1.0f;
     for (int r = 0; r < 4; ++r) {
-        if (results[r].id < 0) continue;
-        const float score = static_cast<float>(4 - results[r].hamming) * 1000.0f +
-                            results[r].margin;
+        if (results[warp][r].id < 0) continue;
+        const float score = static_cast<float>(4 - results[warp][r].hamming) * 1000.0f +
+                            results[warp][r].margin;
         if (score > best_score) {
             best_score = score;
             best = r;
@@ -1261,12 +1435,12 @@ __global__ void k_decode_quads(const uint8_t* __restrict__ gray, int width, int 
     const uint32_t slot = atomicAdd(&counts[1], 1u);
     if (slot >= static_cast<uint32_t>(max_detections)) return;
     bd_detection d;
-    d.id = results[best].id;
-    d.hamming = results[best].hamming;
-    d.decision_margin = results[best].margin;
+    d.id = results[warp][best].id;
+    d.hamming = results[warp][best].hamming;
+    d.decision_margin = results[warp][best].margin;
     for (int k = 0; k < 4; ++k) {
-        d.corners[k * 2 + 0] = results[best].corners[k][0];
-        d.corners[k * 2 + 1] = results[best].corners[k][1];
+        d.corners[k * 2 + 0] = results[warp][best].corners[k][0];
+        d.corners[k * 2 + 1] = results[warp][best].corners[k][1];
     }
     d.reserved = 0;
     detections[slot] = d;
@@ -1362,14 +1536,25 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
     } while (0)
 
     BD_STAGE("memset", cudaMemsetAsync(a.counts, 0, 5 * sizeof(uint32_t), stream));
+    BD_STAGE("memset_hist",
+             (cudaMemsetAsync(a.span_hist, 0, 256 * sizeof(uint32_t), stream),
+              cudaMemsetAsync(a.mean_hist, 0, 256 * sizeof(uint32_t), stream)));
 
     const int tile_count = a.tile_w * a.tile_h;
     const int tile_threads = 128;
+    BD_STAGE("tile_stats",
+             k_tile_stats<<<(tile_count + tile_threads - 1) / tile_threads, tile_threads, 0,
+                            stream>>>(a.gray, a.width, a.height, a.stride, a.tile_min,
+                                      a.tile_max, a.tile_mean, a.tile_w, a.tile_h));
+    BD_STAGE("tile_hist", k_tile_histograms<<<8, 256, 0, stream>>>(
+                                a.tile_min, a.tile_max, a.tile_mean, a.tile_w, a.tile_h,
+                                a.span_hist, a.mean_hist));
+    BD_STAGE("tile_ref",
+             k_tile_reference<<<1, 256, 0, stream>>>(a.span_hist, a.mean_hist, a.tile_ref));
     BD_STAGE("tile_threshold",
              k_tile_threshold<<<(tile_count + tile_threads - 1) / tile_threads, tile_threads,
-                                0, stream>>>(a.gray, a.width, a.height, a.stride,
-                                             a.tile_thresh, a.tile_active, a.tile_w,
-                                             a.tile_h));
+                                0, stream>>>(a.tile_min, a.tile_max, a.tile_ref, a.tile_w,
+                                             a.tile_h, a.tile_thresh, a.tile_active));
     BD_STAGE("row_roi", k_build_row_roi<<<1, 256, 0, stream>>>(
                             a.tile_active, a.tile_w, a.tile_h, a.row_active, a.row_start,
                             a.row_end, a.counts));
@@ -1405,7 +1590,9 @@ void launch_pipeline(const PipelineArgs& a, cudaStream_t stream) {
                               a.counts, a.gray, a.width, a.height, a.stride, a.row_cap,
                               a.max_candidates, a.dim, a.refine_edges, a.quads));
 
-    BD_STAGE("decode", k_decode_quads<<<a.max_candidates, 32, 0, stream>>>(
+    BD_STAGE("decode",
+             k_decode_quads<<<(a.max_candidates + kDecodeWarps - 1) / kDecodeWarps,
+                              kDecodeThreads, 0, stream>>>(
                            a.gray, a.width, a.height, a.stride, a.quads, a.counts,
                            a.max_candidates, a.dim, a.codes, a.code_count, a.max_hamming,
                            a.sharpening, a.min_decision_margin, a.detections,
@@ -1509,6 +1696,12 @@ struct GpuDetector::Impl {
     uint8_t* d_gray = nullptr;
     uint8_t* d_tile_thresh = nullptr;
     uint8_t* d_tile_active = nullptr;
+    uint8_t* d_tile_min = nullptr;
+    uint8_t* d_tile_max = nullptr;
+    uint8_t* d_tile_mean = nullptr;
+    uint32_t* d_span_hist = nullptr;
+    uint32_t* d_mean_hist = nullptr;
+    uint32_t* d_tile_ref = nullptr;
     uint8_t* d_row_active = nullptr;
     int* d_row_start = nullptr;
     int* d_row_end = nullptr;
@@ -1564,6 +1757,12 @@ struct GpuDetector::Impl {
         BD_FREE_DEV(d_gray);
         BD_FREE_DEV(d_tile_thresh);
         BD_FREE_DEV(d_tile_active);
+        BD_FREE_DEV(d_tile_min);
+        BD_FREE_DEV(d_tile_max);
+        BD_FREE_DEV(d_tile_mean);
+        BD_FREE_DEV(d_span_hist);
+        BD_FREE_DEV(d_mean_hist);
+        BD_FREE_DEV(d_tile_ref);
         BD_FREE_DEV(d_row_active);
         BD_FREE_DEV(d_row_start);
         BD_FREE_DEV(d_row_end);
@@ -1608,6 +1807,8 @@ bool GpuDetector::Impl::initialize(std::string* error) {
 
     const int width = cfg.width;
     const int height = cfg.height;
+    // The cap bounds candidate collection, so it decides recall on dense
+    // frames; the 1080p dense scenes really do produce more than 384.
     max_candidates = cfg.max_candidates > 0
                          ? std::min(std::max(cfg.max_candidates, 16), 1024)
                          : std::min(std::max(next_power_of_two((width * height) / 4096), 64), 1024);
@@ -1641,6 +1842,17 @@ bool GpuDetector::Impl::initialize(std::string* error) {
                             static_cast<size_t>(args.tile_w) * args.tile_h, error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_tile_active),
                             static_cast<size_t>(args.tile_w) * args.tile_h, error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_tile_min),
+                            static_cast<size_t>(args.tile_w) * args.tile_h, error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_tile_max),
+                            static_cast<size_t>(args.tile_w) * args.tile_h, error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_tile_mean),
+                            static_cast<size_t>(args.tile_w) * args.tile_h, error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_span_hist), 256 * sizeof(uint32_t),
+                            error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_mean_hist), 256 * sizeof(uint32_t),
+                            error);
+    ok = ok && device_alloc(reinterpret_cast<void**>(&d_tile_ref), 2 * sizeof(uint32_t), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_row_active),
                             static_cast<size_t>(args.tile_h), error);
     ok = ok && device_alloc(reinterpret_cast<void**>(&d_row_start),
@@ -1696,6 +1908,12 @@ bool GpuDetector::Impl::initialize(std::string* error) {
     args.gray = d_gray;
     args.tile_thresh = d_tile_thresh;
     args.tile_active = d_tile_active;
+    args.tile_min = d_tile_min;
+    args.tile_max = d_tile_max;
+    args.tile_mean = d_tile_mean;
+    args.span_hist = d_span_hist;
+    args.mean_hist = d_mean_hist;
+    args.tile_ref = d_tile_ref;
     args.row_active = d_row_active;
     args.row_start = d_row_start;
     args.row_end = d_row_end;

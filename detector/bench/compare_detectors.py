@@ -87,6 +87,19 @@ class BdcudatagBackend(Backend):
             ("decode_sharpening", ctypes.c_float),
         ]
 
+    class _Stats(ctypes.Structure):
+        _fields_ = [
+            ("frames", ctypes.c_uint64),
+            ("last_gpu_ms", ctypes.c_float),
+            ("average_gpu_ms", ctypes.c_float),
+            ("last_total_ms", ctypes.c_float),
+            ("runs", ctypes.c_int32),
+            ("candidates", ctypes.c_int32),
+            ("detections", ctypes.c_int32),
+            ("quads", ctypes.c_int32),
+            ("roi_rows", ctypes.c_int32),
+        ]
+
     class _Detection(ctypes.Structure):
         _fields_ = [
             ("id", ctypes.c_int32),
@@ -97,7 +110,7 @@ class BdcudatagBackend(Backend):
             ("homography", ctypes.c_float * 9),
         ]
 
-    def __init__(self, lib_path: str) -> None:
+    def __init__(self, lib_path: str, max_detections: int = 32) -> None:
         # Python on Windows only searches the library's own directory and the
         # system paths for dependencies, not PATH, so cudart must be added
         # explicitly before loading bdcudatag.
@@ -137,18 +150,23 @@ class BdcudatagBackend(Backend):
         ]
         self.lib.bd_detector_detect_host.restype = ctypes.c_int32
         self.lib.bd_detector_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.bd_detector_get_stats.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(self._Stats),
+        ]
 
         raw_version = self.lib.bd_version_string()
         self.version = raw_version.decode() if raw_version else "unknown"
         self.handle = None
         self.width = 0
-        self.out = (self._Detection * 32)()
+        self.max_detections = max_detections
+        self.out = (self._Detection * max_detections)()
 
     def prepare(self, width: int, height: int) -> None:
         self.close()
         config = self._Config()
         self.lib.bd_config_init(ctypes.byref(config))
-        config.max_detections = 32
+        config.max_detections = self.max_detections
         status = ctypes.c_int32(0)
         handle = self.lib.bd_detector_create(
             0, width, height, ctypes.byref(config), ctypes.byref(status)
@@ -164,15 +182,26 @@ class BdcudatagBackend(Backend):
             image.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             self.width,
             self.out,
-            32,
+            self.max_detections,
         )
         if count < 0:
             raise RuntimeError(f"bd_detector_detect_host failed with status {count}")
         found = []
-        for i in range(min(count, 32)):
+        for i in range(min(count, self.max_detections)):
             corners = np.array(self.out[i].corners, dtype=np.float64).reshape(4, 2)
             found.append(Detection(int(self.out[i].id), corners))
         return found
+
+    def stats(self) -> dict:
+        stats = self._Stats()
+        self.lib.bd_detector_get_stats(self.handle, ctypes.byref(stats))
+        return {
+            "runs": int(stats.runs),
+            "candidates": int(stats.candidates),
+            "quads": int(stats.quads),
+            "roi_rows": int(stats.roi_rows),
+            "gpu_ms": float(stats.average_gpu_ms),
+        }
 
     def close(self) -> None:
         if self.handle:

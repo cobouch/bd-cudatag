@@ -110,6 +110,9 @@ void run_resolution(int width, int height, int frames, int scene_count, bool mar
     std::sort(times_ms.begin(), times_ms.end());
     const double median_ms = percentile(times_ms, 0.50);
     const double p95_ms = percentile(times_ms, 0.95);
+    double mean_ms = 0.0;
+    for (const double value : times_ms) mean_ms += value;
+    if (!times_ms.empty()) mean_ms /= static_cast<double>(times_ms.size());
 
     // One accuracy pass over the unique scenes.
     Accuracy accuracy;
@@ -148,8 +151,9 @@ void run_resolution(int width, int height, int frames, int scene_count, bool mar
     const Stats stats = detector.stats();
 
     if (!markdown) {
-        std::printf("%dx%d: median %.3f ms, p95 %.3f ms, tags found %.1f%% (%d/%d), ",
-                    width, height, median_ms, p95_ms, recall, accuracy.found,
+        std::printf("%dx%d: median %.3f ms, mean %.3f ms, p95 %.3f ms, "
+                    "tags found %.1f%% (%d/%d), ",
+                    width, height, median_ms, mean_ms, p95_ms, recall, accuracy.found,
                     accuracy.tags);
         if (accuracy.has_corners) {
             std::printf("corner %.2f px, ", accuracy.corner_median_px);

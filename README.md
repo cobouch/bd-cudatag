@@ -19,13 +19,20 @@ validated bit-for-bit against the canonical tag images; see
 
 Each frame runs as one CUDA graph with pinned host staging:
 
-1. **Coarse ROI.** The image is reduced to 8x8 tiles. A tile is active when its
-   min/max range exceeds a contrast threshold. Active tile rows are closed
-   vertically and dilated horizontally, producing the only rows that are
-   binarized, run-length encoded and searched. Flat background rows cost almost
-   nothing, and the number of searched rows is reported as `roiRows`.
-2. **Binarization.** A per-tile adaptive threshold is applied only inside the
-   ROI; inactive rows are filled as background.
+1. **Coarse ROI.** The image is reduced to 8x8 tiles and each tile's min/max is
+   measured. The threshold kernel pools those extremes over a 3x3 tile window
+   and requires the pooled range to clear a per-frame noise floor (1.5x the
+   lower quartile of tile spans), so sensor noise alone cannot mark tiles
+   active. Active tile rows are closed vertically and dilated horizontally,
+   producing the only rows that are binarized, run-length encoded and searched.
+   Flat background rows cost almost nothing, and the number of searched rows is
+   reported as `roiRows`.
+2. **Binarization.** A tile with real contrast uses the midpoint of its pooled
+   range. A tile with no contrast of its own falls back to the frame's Otsu
+   split over the tile means, so a dim background stays white instead of merging
+   with the tag border, while a thick black border stays black instead of
+   splitting into a thin ring. Only rows inside the ROI are binarized; inactive
+   rows are filled as background.
 3. **Run-length connected components.** Black runs are extracted with one warp
    per 32-pixel chunk, joined at chunk boundaries, and merged across rows with a
    lock-free union-find.
@@ -40,7 +47,9 @@ Each frame runs as one CUDA graph with pinned host staging:
    simplification, which dominated frame time.
 6. **Decoding.** The quad is sampled with a homography for all four rotations,
    matched against the family code table by popcount, and scored by decision
-   margin. No decoding or corner work happens for frames with no candidates.
+   margin. One warp decodes one candidate and eight warps share a block, so the
+   grid is not padded to `max_candidates`. No decoding or corner work happens
+   for frames with no candidates.
 
 Everything is allocated at construction time; `detect` does not allocate device
 memory. A CUDA graph is captured on the first host-frame call and replayed
@@ -116,37 +125,67 @@ resolution (`quad_decimate=1.0`, `refine_edges=1`, one thread).
 
 | Resolution | Detector | Median (ms) | p95 (ms) | Tags found | Corner error (px) | Wrong IDs |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 640x480 | bdcudatag | 0.28 | 0.31 | 100.0% | 0.13 | 0 |
-| 640x480 | NAPA | 0.24 | 0.27 | 99.6% | 0.10 | 0 |
-| 640x480 | NAPA (min_tag_px=16) | 0.54 | 0.77 | 100.0% | 0.10 | 0 |
+| 640x480 | bdcudatag | 0.31 | 0.34 | 100.0% | 0.13 | 0 |
+| 640x480 | NAPA | 0.25 | 0.28 | 99.6% | 0.10 | 0 |
+| 640x480 | NAPA (min_tag_px=16) | 0.55 | 0.59 | 100.0% | 0.10 | 0 |
 | 640x480 | ArUco (subpixel) | 1.13 | 1.36 | 99.6% | 0.30 | 0 |
-| 640x480 | AprilTag 3 (full res) | 2.02 | 2.25 | 100.0% | 0.71 | 0 |
-| 1280x720 | bdcudatag | 0.39 | 0.43 | 100.0% | 0.16 | 0 |
-| 1280x720 | NAPA | 0.44 | 0.50 | 100.0% | 0.15 | 0 |
-| 1280x720 | NAPA (min_tag_px=16) | 1.32 | 1.41 | 100.0% | 0.15 | 0 |
-| 1280x720 | ArUco (subpixel) | 2.59 | 3.21 | 100.0% | 0.29 | 0 |
-| 1280x720 | AprilTag 3 (full res) | 6.05 | 8.20 | 100.0% | 0.71 | 0 |
-| 1280x800 | bdcudatag | 0.39 | 3.03 | 100.0% | 0.17 | 0 |
-| 1280x800 | NAPA | 0.51 | 0.75 | 100.0% | 0.16 | 0 |
-| 1280x800 | NAPA (min_tag_px=16) | 1.49 | 2.08 | 100.0% | 0.16 | 0 |
-| 1280x800 | ArUco (subpixel) | 2.74 | 3.32 | 100.0% | 0.30 | 0 |
-| 1280x800 | AprilTag 3 (full res) | 6.51 | 8.72 | 100.0% | 0.72 | 0 |
-| 1920x1080 | bdcudatag | 0.58 | 3.89 | 100.0% | 0.23 | 0 |
-| 1920x1080 | NAPA | 0.78 | 1.06 | 100.0% | 0.23 | 0 |
-| 1920x1080 | NAPA (min_tag_px=16) | 2.64 | 3.69 | 100.0% | 0.23 | 0 |
-| 1920x1080 | ArUco (subpixel) | 5.37 | 5.99 | 100.0% | 0.33 | 0 |
-| 1920x1080 | AprilTag 3 (full res) | 12.12 | 16.44 | 100.0% | 0.72 | 0 |
+| 640x480 | AprilTag 3 (full res) | 2.11 | 2.38 | 100.0% | 0.71 | 0 |
+| 1280x720 | bdcudatag | 0.41 | 0.44 | 100.0% | 0.16 | 0 |
+| 1280x720 | NAPA | 0.47 | 0.52 | 100.0% | 0.15 | 0 |
+| 1280x720 | NAPA (min_tag_px=16) | 1.33 | 1.43 | 100.0% | 0.15 | 0 |
+| 1280x720 | ArUco (subpixel) | 2.30 | 2.94 | 100.0% | 0.29 | 0 |
+| 1280x720 | AprilTag 3 (full res) | 6.11 | 6.62 | 100.0% | 0.71 | 0 |
+| 1280x800 | bdcudatag | 0.44 | 0.49 | 100.0% | 0.17 | 0 |
+| 1280x800 | NAPA | 0.48 | 0.56 | 100.0% | 0.16 | 0 |
+| 1280x800 | NAPA (min_tag_px=16) | 1.41 | 1.50 | 100.0% | 0.16 | 0 |
+| 1280x800 | ArUco (subpixel) | 2.39 | 3.10 | 100.0% | 0.30 | 0 |
+| 1280x800 | AprilTag 3 (full res) | 6.57 | 7.32 | 100.0% | 0.72 | 0 |
+| 1920x1080 | bdcudatag | 0.60 | 0.64 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA | 0.77 | 0.90 | 100.0% | 0.23 | 0 |
+| 1920x1080 | NAPA (min_tag_px=16) | 2.54 | 2.76 | 100.0% | 0.23 | 0 |
+| 1920x1080 | ArUco (subpixel) | 4.49 | 5.79 | 100.0% | 0.33 | 0 |
+| 1920x1080 | AprilTag 3 (full res) | 12.21 | 13.25 | 100.0% | 0.72 | 0 |
 
-bdcudatag is the fastest detector at 1280x720 (0.39 vs 0.44 ms for NAPA), at
-1280x800 (0.39 vs 0.51 ms) and at 1920x1080 (0.58 vs 0.78 ms). Its corner error
+bdcudatag is the fastest detector at 1280x720 (0.41 vs 0.47 ms for NAPA), at
+1280x800 (0.44 vs 0.48 ms) and at 1920x1080 (0.60 vs 0.77 ms). Its corner error
 matches NAPA's at 720p and 1080p (0.16 and 0.23 px) and is 0.01 px higher at
-800p. At 640x480 NAPA is still slightly faster (0.24 vs 0.28 ms) and slightly
+800p. At 640x480 NAPA is still slightly faster (0.25 vs 0.31 ms) and slightly
 more accurate (0.10 vs 0.13 px), but it misses one tag where bdcudatag finds
-all 256. The 3.03 ms p95 at 1280x800 and 3.89 ms at 1920x1080 are host stalls in
-the Python process (the native benchmark measures 0.37 and 0.54 ms p95).
-bdcudatag is 4-10x faster than ArUco and 7-21x faster than full-resolution
-AprilTag. No detector decoded a decoy, so the wrong-id column is zero
-throughout; bdcudatag finds every tag at every resolution.
+all 256. bdcudatag is 3.6-7.5x faster than ArUco and 7-20x faster than
+full-resolution AprilTag. No detector decoded a decoy, so the wrong-id column is
+zero throughout; bdcudatag finds every tag at every resolution.
+
+### NAPA AprilTag Synthetic Benchmark
+
+`detector/bench/datasets/napa-benchmark` holds the 4,500-frame NAPA synthetic
+corpus: `main` (20 scenarios), `stress` (four harder ones) and `range` (a size
+sweep), at 640x480, 1280x720 and 1920x1080, with float64 ground-truth corners
+bounding the black square. `eval_napa.py` scores bdcudatag on it through the
+same C ABI and the same match rule as the harness above:
+
+```bash
+cd detector/bench
+.venv/Scripts/python eval_napa.py --group main --group stress --group range \
+    --markdown napa_results.md
+```
+
+| Group | Resolution | Tags | Tags found | Corner (px) | Wrong IDs | Mean (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| main | 640x480 | 1811 | 99.4% | 0.03 | 1 | 0.33 |
+| main | 1280x720 | 1888 | 99.4% | 0.03 | 0 | 0.45 |
+| main | 1920x1080 | 1822 | 98.9% | 0.03 | 0 | 0.73 |
+| stress | 640x480 | 1289 | 100.0% | 0.06 | 0 | 0.38 |
+| stress | 1280x720 | 1642 | 99.8% | 0.06 | 0 | 0.58 |
+| stress | 1920x1080 | 1646 | 99.5% | 0.07 | 0 | 0.85 |
+| range | 640x480 | 900 | 100.0% | 0.05 | 0 | 0.26 |
+
+Across the whole corpus bdcudatag finds 10,944 of 10,998 tags (99.5%) with a
+0.03 px median corner error. The single wrong ID is `decoys-640x480-042`, the
+corpus's documented two-bit collision with id 323; the same frame is NAPA's only
+wrong ID. The full setup now clears every bad-lighting and low-resolution
+scenario. Times are end-to-end `detect` calls, so the 2 MB host-to-device copy
+dominates 1080p; in the standard 32-scene sweep above the mean is 0.42 ms across
+the four resolutions.
 
 `detect` is synchronous and includes host-to-device staging and a device
 synchronization, so these are end-to-end frame times rather than kernel times.
