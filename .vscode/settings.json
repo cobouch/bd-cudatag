@@ -1,0 +1,6 @@
+{
+    "java.configuration.updateBuildConfiguration": "automatic",
+    "java.compile.nullAnalysis.mode": "automatic",
+    "git.ignoreLimitWarning": true,
+    "cmake.sourceDirectory": "C:/Users/cobou/Documents/GitHub/bd-cudatag/detector"
+}

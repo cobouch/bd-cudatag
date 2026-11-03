@@ -1,0 +1,11 @@
+# Third-party notices
+
+## Tag family codewords
+
+The tag36h11 and tag16h5 codewords and cell layouts are defined by the AprilTag
+project (https://github.com/AprilRobotics/apriltag), Copyright (C) 2013-2016,
+The Regents of The University of Michigan. AprilTag is distributed under the BSD
+2-Clause license. You can see APRILTAG_LICENSE for further information.
+
+Only the family definitions (the numeric codewords and their cell positions) are
+used here. The detector implementation in this repository is original.

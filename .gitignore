@@ -1,0 +1,12 @@
+# Detector directories
+detector/build/
+build/
+
+# Java API directories
+java-api/.gradle
+java-api/.kotlin
+java-api/build
+java-api/bin
+
+# Local benchmark dumps
+*.pgm
