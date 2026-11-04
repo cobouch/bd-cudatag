@@ -15,6 +15,10 @@ tag-family code tables are generated from the published AprilTag families and
 validated bit-for-bit against the canonical tag images; see
 `detector/third_party/NOTICE`.
 
+## Disclaimer for other teams
+
+This project was developed for Team 6324 only, and thus only fulfils their needs. This code is provided for reference—while use by other teams is possible, we do not endorse such use and will not provide any form of support or assistance for other teams.
+
 ## Pipeline
 
 Each frame runs as one CUDA graph with pinned host staging:
